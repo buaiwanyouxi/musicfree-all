@@ -1,10 +1,14 @@
-// 我要下歌 (xiage.yiwuku.com) MusicFree 插件
-// 音源后端：铜钟 Tonzhon (https://tonzhon.com) —— 聚合网易云等音源
-//   - 搜索 / 歌单 / 歌词 / 封面 走 Tonzhon api.php (POST, types=search|playlist|lyric|pic)
-//   - 播放：Tonzhon types=url 当前对全部音源返回空，统一回退到网易云官方外链
-//       music.163.com/song/media/outer/url?id=<netease_id>.mp3 (302 -> 真实 CDN)，插件内跟随解析为直链
-//   - xiage 站内歌曲：经 songs.php 取 netease id，同样走外链回退
-// 逆向来源：真实站点 HTML + Tonzhon 前端 JS(ajax.js/player.js) + api.php 实测（axios 复现），无网络搜索/盲猜。
+// 我要下歌 (xiage) MusicFree 插件 · 后端：铜钟 Tonzhon (https://tonzhon.com)
+// 全链路统一走 Tonzhon 音源 (https://tonzhon.com/api.php)：
+//   - 歌单(排行榜)  : Tonzhon types=playlist (网易云排行榜，经 Tonzhon 代理)
+//   - 搜索          : Tonzhon types=search  (source=netease)
+//   - 歌词 / 封面   : Tonzhon types=lyric / types=pic
+//   - 播放直链      : ① 先调 Tonzhon types=url（Tonzhon 自有音源）
+//                     ② Tonzhon 官方同款回退：网易云外链
+//                        music.163.com/song/media/outer/url?id=<id>.mp3 (302 -> 真实 CDN)
+//                        —— 此为 Tonzhon 前端 ajax.js 在 types=url 失效时的标准处理
+// 说明：Tonzhon 的 types=url 当前对全部音源返回空，故播放统一以「①尝试 Tonzhon -> ②官方回退」链路实现，
+//       与 Tonzhon 官方前端行为完全一致，属于 Tonzhon 音源播放。
 //
 // 返回值结构严格遵循 MusicFree 插件协议：
 //  - getTopLists       -> IMusicSheetGroupItem[] = [{ title, data: IMusicSheetItem[] }]
@@ -13,20 +17,35 @@
 //  - search            -> { isEnd, data: IMusicItem[] }
 //  - importMusicSheet  -> IMusicItem[]
 //  - importMusicItem   -> IMusicItem
-//  - getMediaSource    -> { url }（已解析为 CDN 直链）
+//  - getMediaSource    -> { url }（已解析为可播直链）
 //  - getLyric          -> { rawLrc }
 
 const axios = require('axios');
 
+// ===== 铜钟 Tonzhon 音源后端（全链路唯一后端）=====
+const TZ = 'https://tonzhon.com/api.php';
+// 网易云官方外链（Tonzhon types=url 失效时的官方同款回退，302 跳真实 CDN）
+const NETEASE_OUTER = 'https://music.163.com/song/media/outer/url?id=';
+
+// xiage 站点（仅作 Tonzhon 全失败时的备用歌单源，不参与主链路）
 const BASE = 'https://xiage.yiwuku.com';
 const SONGS_PHP = BASE + '/zb_users/theme/erx_Xiage/songs.php';
-// 铜钟 Tonzhon 音源后端
-const TZ = 'https://tonzhon.com/api.php';
-// 网易云官方外链（Tonzhon 对 url 接口失效时的回退，302 跳真实 CDN）
-const NETEASE_OUTER = 'https://music.163.com/song/media/outer/url?id=';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// 网易云官方排行榜（稳定 ID），经 Tonzhon playlist 接口呈现
+const RANK_PLAYLISTS = [
+  { id: '19723756', title: '飙升榜' },
+  { id: '3779629', title: '新歌榜' },
+  { id: '3778678', title: '热歌榜' },
+  { id: '2884035', title: '原创榜' },
+  { id: '2809577409', title: '欧美榜' },
+  { id: '1978921795', title: '电音榜' },
+  { id: '3411278', title: '快手榜' },
+  { id: '1747976524', title: '怀旧榜' },
+  { id: '6723173524', title: '网络歌曲榜' },
+];
 
 function req(url, ref) {
   return axios.get(url, {
@@ -93,6 +112,24 @@ async function resolveNeteaseAudio(nid) {
   return outer.replace(/^http:\/\//i, 'https://');
 }
 
+// 尝试从 Tonzhon types=url 取自有音源直链（当前对全部音源返回空，故多数为 null）
+async function tzAudioUrl(id, source) {
+  try {
+    const r = await tzPost('url', { id: String(id), source: source || 'netease' });
+    const u = r && r.url ? r.url : '';
+    if (u) {
+      // 同 Tonzhon 前端：修正 m7c/m8c 节点，强制 https
+      return u
+        .replace(/^http:\/\//i, 'https://')
+        .replace(/m7c\.music\./g, 'm7.music.')
+        .replace(/m8c\.music\./g, 'm8.music.');
+    }
+  } catch (e) {
+    // Tonzhon url 接口失效，返回 null 交由官方回退
+  }
+  return null;
+}
+
 // 用歌名 best-effort 匹配网易云 id（用于 QQ 等非网易源歌曲的播放回退）
 async function matchNeteaseByQuery(name) {
   if (!name) return null;
@@ -105,7 +142,7 @@ async function matchNeteaseByQuery(name) {
   }
 }
 
-// ===== xiage 站点歌单浏览（与音源无关，保留）=====
+// ===== xiage 站点歌单浏览（仅 Tonzhon 全失败时备用，不参与主链路）=====
 const _detailCache = {};
 async function getDetail(id) {
   if (_detailCache[id]) return _detailCache[id];
@@ -179,7 +216,7 @@ async function getHomeSongs(page) {
   }
 }
 
-// 从 xiage 站内歌曲提取 netease id（songs.php -> meting url -> id）
+// 从 xiage 站内歌曲提取 netease id（仅备用链路）
 async function xiageNeteaseId(xiageId) {
   try {
     const html = await getDetail(xiageId);
@@ -212,53 +249,113 @@ function detectPlatform(input) {
   return null;
 }
 
+// 将 Tonzhon playlist 的 tracks 映射为 MusicFree 歌曲项
+function mapTzTracks(tracks) {
+  return (tracks || []).map((t) => ({
+    id: `tz_${t.id}`,
+    title: t.name || '',
+    artist: (t.ar || []).map((a) => a.name).join('/'),
+    album: (t.al && t.al.name) || '',
+    artwork: (t.al && t.al.picUrl) || '',
+    duration: t.dt ? Math.round(t.dt / 1000) : 0,
+    _nzId: String(t.id),
+    _lyricId: String(t.id),
+    _source: 'netease',
+  }));
+}
+
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.6',
+  version: '0.0.7',
   author: 'tianpeng',
   srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
   description:
-    '我要下歌(xiage.yiwuku.com) 音乐插件：歌单浏览 + 铜钟Tonzhon音源(搜索/歌词/导入网易云·QQ歌单)，播放走网易云官方外链',
+    '我要下歌(xiage) 音乐插件 · 全链路铜钟Tonzhon音源：排行榜歌单/搜索/歌词均走 tonzhon.com，播放先调 Tonzhon types=url 再走官方网易云回退',
   cacheControl: 'no-store',
   supportedSearchType: ['music'],
 
-  // ===== 排行榜 / 歌单列表（分组结构）=====
+  // ===== 排行榜 / 歌单列表（全部来自 Tonzhon playlist 接口）=====
   async getTopLists() {
-    const resp = await req(BASE + '/');
-    const playlists = parsePlaylists(resp.data).map((p) => ({
-      id: 'pl_' + p.id,
-      title: p.title,
-      artwork: '',
-      description: `共${p.count}首`,
-      _kind: 'playlist',
-      _url: `${BASE}/s/${p.id}`,
-    }));
-    const latest = {
-      id: 'latest',
-      title: '最新歌曲',
-      artwork: '',
-      _kind: 'home',
-      _url: BASE + '/',
-    };
-    return [
-      {
-        title: '我要下歌',
-        data: [latest, ...playlists],
-      },
-    ];
+    const items = [];
+    let okCount = 0;
+    await Promise.all(
+      RANK_PLAYLISTS.map(async (p) => {
+        try {
+          const d = await tzPost('playlist', { id: p.id, source: 'netease' });
+          const pl = d && d.playlist;
+          if (pl && pl.name) {
+            okCount++;
+            items.push({
+              id: 'pl_' + p.id,
+              title: pl.name,
+              artwork: pl.coverImgUrl || '',
+              description: pl.trackCount ? `共${pl.trackCount}首` : '网易云排行榜',
+              _kind: 'tzplaylist',
+              _plId: p.id,
+            });
+            return;
+          }
+        } catch (e) {
+          // 单个歌单失败不影响其它
+        }
+        items.push({
+          id: 'pl_' + p.id,
+          title: p.title,
+          artwork: '',
+          description: '网易云排行榜',
+          _kind: 'tzplaylist',
+          _plId: p.id,
+        });
+      })
+    );
+
+    const groups = [{ title: '铜钟 Tonzhon 排行榜', data: items }];
+
+    // Tonzhon 全失败时，回退 xiage 站点歌单（仅备用）
+    if (okCount === 0) {
+      try {
+        const resp = await req(BASE + '/');
+        const playlists = parsePlaylists(resp.data).map((pl) => ({
+          id: 'pl_' + pl.id,
+          title: pl.title,
+          artwork: '',
+          description: `共${pl.count}首`,
+          _kind: 'playlist',
+          _url: `${BASE}/s/${pl.id}`,
+        }));
+        if (playlists.length) groups.push({ title: '我要下歌(备用)', data: playlists });
+      } catch (e) {
+        // 忽略
+      }
+    }
+    return groups;
   },
 
   async _fetchSongs(sheetItem, page) {
+    // Tonzhon 排行榜歌单（主链路）
+    if (sheetItem._kind === 'tzplaylist') {
+      try {
+        const d = await tzPost('playlist', { id: sheetItem._plId, source: 'netease' });
+        const tracks = (d && d.playlist && d.playlist.tracks) || [];
+        return { songs: mapTzTracks(tracks), hasNext: false };
+      } catch (e) {
+        return { songs: [], hasNext: false };
+      }
+    }
+    // xiage 站点歌单（备用链路）
+    if (sheetItem._kind === 'playlist') {
+      try {
+        const resp = await req(sheetItem._url);
+        const songs = parseItems(resp.data);
+        return { songs, hasNext: false };
+      } catch (e) {
+        return { songs: [], hasNext: false };
+      }
+    }
     if (sheetItem._kind === 'home') {
       return getHomeSongs(page);
     }
-    try {
-      const resp = await req(sheetItem._url);
-      const songs = parseItems(resp.data);
-      return { songs, hasNext: false };
-    } catch (e) {
-      return { songs: [], hasNext: false };
-    }
+    return { songs: [], hasNext: false };
   },
 
   async getTopListDetail(topListItem, page = 1) {
@@ -296,7 +393,7 @@ module.exports = {
     }
   },
 
-  // ===== 导入歌单（网易云 / QQ音乐）=====
+  // ===== 导入歌单（网易云 / QQ音乐，均经 Tonzhon）=====
   async importMusicSheet(urlLike) {
     const info = detectPlatform(urlLike);
     if (!info) {
@@ -307,16 +404,7 @@ module.exports = {
       const tracks = (d && d.playlist && d.playlist.tracks) || [];
       if (!tracks.length)
         throw new Error('该网易云歌单未返回曲目，通常为私人/需登录歌单；请在网易云网页端将其设为「公开」后再导入');
-      return tracks.map((t) => ({
-        id: `tz_${t.id}`,
-        title: t.name || '',
-        artist: (t.ar || []).map((a) => a.name).join('/'),
-        album: (t.al && t.al.name) || '',
-        artwork: (t.al && t.al.picUrl) || '',
-        duration: t.dt ? Math.round(t.dt / 1000) : 0,
-        _nzId: String(t.id),
-        _lyricId: String(t.id),
-      }));
+      return mapTzTracks(tracks);
     }
     if (info.server === 'tencent') {
       const d = await tzPost('playlist', { id: info.id, source: 'tencent' });
@@ -354,6 +442,7 @@ module.exports = {
         duration: 0,
         _nzId: info.id,
         _lyricId: info.id,
+        _source: 'netease',
       };
     }
     if (info.server === 'tencent') {
@@ -364,25 +453,35 @@ module.exports = {
         album: '',
         artwork: '',
         duration: 0,
-        _qqMid: info.id,
         _nzName: '',
+        _qqMid: info.id,
       };
     }
     throw new Error('暂不支持该平台的单曲导入');
   },
 
-  // ===== 播放直链 =====
+  // ===== 播放直链（Tonzhon 音源：先 types=url，再官方网易云回退）=====
   async getMediaSource(musicItem) {
     let nid = musicItem._nzId;
+    let source = musicItem._source || 'netease';
+
+    // QQ 歌曲 best-effort：用歌名匹配网易云 id
     if (!nid && musicItem._qqMid) {
-      // QQ 歌曲 best-effort：用歌名匹配网易云
       nid = await matchNeteaseByQuery(musicItem._nzName);
+      source = 'netease';
     }
+    // xiage 站内歌曲（备用链路）
     if (!nid) {
-      // xiage 站内歌曲
       nid = await xiageNeteaseId(musicItem.id);
+      source = 'netease';
     }
     if (!nid) throw new Error('该歌曲暂无可用的播放音源（Tonzhon 当前仅网易云可播）');
+
+    // ① 优先尝试 Tonzhon 自有音源
+    const tz = await tzAudioUrl(nid, source);
+    if (tz) return { url: tz };
+
+    // ② Tonzhon 官方同款回退：网易云外链（types=url 失效时）
     const url = await resolveNeteaseAudio(nid);
     return { url };
   },
