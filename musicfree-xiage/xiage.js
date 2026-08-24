@@ -5,12 +5,18 @@
 // 已知限制（站点侧，非插件 bug）：
 //  - 服务端搜索接口（cmd.php?act=search / search.php?q=）对任意关键词均返回固定的一套
 //    “歌单合集”卡片，搜索词被完全忽略。此为站点反爬/配置问题，纯 HTTP 抓取无法触发真实搜索。
-//    因此本插件 search 实现为“可浏览目录最佳匹配”：在最新歌曲 + 歌单合集名中做子串匹配，
+//    因此本插件 search 实现为“可浏览目录最佳匹配”：在最新歌曲池 + 歌单合集名中做子串匹配，
 //    命中歌单时展开该歌单内歌曲。覆盖最新/热门内容，无法检索全站历史歌曲。
 //  - 歌单详情页（/s/ID）单页最多展示 12 首，站点无分页接口，大歌单会被截断（站点限制）。
 //  - 部分歌曲仅提供网盘（迅雷）下载、无在线播放源，此类在 getMediaSource 抛友好错误。
 //  - 歌词取自详情页 meta description（纯文本，无逐行时间戳）。
 //  - 播放直链为 kuwo CDN，可能带时效，故 cacheControl 设为 no-store。
+//
+// 返回值结构严格遵循 MusicFree 插件协议：
+//  - getTopLists  -> IMusicSheetGroupItem[] = [{ title, data: IMusicSheetItem[] }]
+//  - getTopListDetail / getMusicSheetInfo -> { isEnd, musicList: IMusicItem[] }
+//  - search -> { isEnd, data: IMusicItem[] }
+//  - importMusicSheet / importMusicItem -> IMusicItem[]
 
 const axios = require('axios');
 
@@ -78,7 +84,6 @@ function parseItems(html) {
       artist: artistM ? artistM[1].trim() : '',
       album: '',
       duration: parseDuration(durM ? durM[1] : ''),
-      _id: id,
     });
   }
   return list;
@@ -99,63 +104,96 @@ function parsePlaylists(html) {
   return list;
 }
 
+// 抓取首页某页的“最新歌曲”列表。page<=1 取首页，否则取 /page_N.html
+async function getHomeSongs(page) {
+  const url = page <= 1 ? BASE + '/' : `${BASE}/page_${page}.html`;
+  try {
+    const resp = await req(url);
+    const songs = parseItems(resp.data);
+    const hasNext = /class="next"/.test(resp.data);
+    return { songs, hasNext };
+  } catch (e) {
+    return { songs: [], hasNext: false };
+  }
+}
+
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.3',
+  version: '0.0.4',
   author: 'tianpeng',
   srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
-  description: '我要下歌(xiage.yiwuku.com) 音乐插件：歌单/排行榜浏览、最佳匹配搜索、在线播放、歌词',
+  description: '我要下歌(xiage.yiwuku.com) 音乐插件：歌单/排行榜浏览、最佳匹配搜索、在线播放、歌词、导入歌单',
   cacheControl: 'no-store',
   supportedSearchType: ['music'],
 
-  // ===== 歌单 / 排行榜 =====
-  // 站点无独立榜单接口，以两类可浏览内容构成：
-  //   1) “最新歌曲”：首页最新上传（支持 /page_N.html 翻页）—— 完整可翻页
-  //   2) “歌单合集”：站点精选歌单（每张 /s/ID 内含若干歌曲，单页最多 12 首，站点限制）
+  // ===== 排行榜 / 歌单列表（分组结构）=====
+  // 协议：返回 IMusicSheetGroupItem[] = [{ title, data: IMusicSheetItem[] }]
+  // ⚠️ 必须包一层分组，MusicFree 按 group.data 渲染，扁平数组会报 length of undefined
   async getTopLists() {
     const resp = await req(BASE + '/');
     const playlists = parsePlaylists(resp.data).map((p) => ({
       id: 'pl_' + p.id,
       title: p.title,
-      coverImg: '',
-      _type: 'playlist',
+      artwork: '',
+      description: `共${p.count}首`,
       _kind: 'playlist',
       _url: `${BASE}/s/${p.id}`,
-      description: `共${p.count}首`,
     }));
     const latest = {
       id: 'latest',
       title: '最新歌曲',
-      coverImg: '',
-      _type: 'playlist',
+      artwork: '',
       _kind: 'home',
       _url: BASE + '/',
     };
-    return [latest, ...playlists];
+    return [
+      {
+        title: '我要下歌',
+        data: [latest, ...playlists],
+      },
+    ];
   },
 
-  async getTopListDetail(topListItem, page = 1) {
-    let url;
-    if (topListItem._kind === 'home') {
-      // 首页最新歌曲：分页地址 /page_N.html
-      url = page <= 1 ? topListItem._url : `${BASE}/page_${page}.html`;
-    } else {
-      // 歌单合集：/s/ID 单页（站点无分页接口，hasNext 恒为 false）
-      url = topListItem._url;
+  // 内部：根据 sheetItem 抓取歌曲（home 翻页 / playlist 单页）
+  async _fetchSongs(sheetItem, page) {
+    if (sheetItem._kind === 'home') {
+      return getHomeSongs(page);
     }
-    const resp = await req(url);
-    const data = parseItems(resp.data);
-    const hasNext = topListItem._kind === 'home' && /class="next"/.test(resp.data);
+    try {
+      const resp = await req(sheetItem._url);
+      const songs = parseItems(resp.data);
+      // 歌单合集单页，站点无分页接口
+      return { songs, hasNext: false };
+    } catch (e) {
+      return { songs: [], hasNext: false };
+    }
+  },
+
+  // ===== 排行榜详情 =====
+  // 协议：返回 { isEnd, musicList: IMusicItem[] }（注意是 musicList，不是 data）
+  async getTopListDetail(topListItem, page = 1) {
+    const { songs, hasNext } = await this._fetchSongs(topListItem, page);
     return {
-      isEnd: data.length === 0 || !hasNext,
-      data,
+      isEnd: songs.length === 0 || !hasNext,
+      musicList: songs,
+    };
+  },
+
+  // ===== 歌单详情（从导入/收藏进入时调用）=====
+  // 协议同 getTopListDetail
+  async getMusicSheetInfo(sheetItem, page = 1) {
+    const { songs, hasNext } = await this._fetchSongs(sheetItem, page);
+    return {
+      isEnd: songs.length === 0 || !hasNext,
+      musicList: songs,
     };
   },
 
   // ===== 搜索（可浏览目录最佳匹配）=====
+  // 协议：返回 { isEnd, data: IMusicItem[] }
   // 站点服务端搜索对 HTTP 不生效（见文件头说明），故改为：
-  //   1) 抓取首页最新歌曲 + 歌单合集；
-  //   2) 关键词（大小写不敏感）匹配 歌曲标题/歌手 与 歌单名；
+  //   1) 抓取首页前 3 页最新歌曲（≈39 首）构成搜索池；
+  //   2) 抓取歌单合集，关键词（大小写不敏感）匹配 歌曲标题/歌手 与 歌单名；
   //   3) 命中歌单时展开其内歌曲一并返回。
   // 局限性：仅覆盖最新/热门内容，无法检索全站历史歌曲（站点搜索接口失效所致）。
   async search(query, page, type) {
@@ -163,8 +201,18 @@ module.exports = {
     const q = (query || '').trim().toLowerCase();
     if (!q) return { isEnd: true, data: [] };
 
+    // 扩大搜索池：首页前 3 页
+    const homePages = await Promise.all([
+      getHomeSongs(1),
+      getHomeSongs(2),
+      getHomeSongs(3),
+    ]);
+    let songs = [];
+    homePages.forEach((h) => {
+      songs = songs.concat(h.songs);
+    });
+
     const resp = await req(BASE + '/');
-    const songs = parseItems(resp.data);
     const playlists = parsePlaylists(resp.data);
 
     const matchedSongs = songs.filter(
@@ -198,9 +246,41 @@ module.exports = {
     return { isEnd: true, data };
   },
 
+  // ===== 导入歌单 =====
+  // 协议：importMusicSheet(urlLike) -> IMusicItem[]
+  // 用户输入 xiage.yiwuku.com/s/ID 形式的歌单链接，解析后返回歌曲列表
+  async importMusicSheet(urlLike) {
+    const m = String(urlLike || '').match(/\/s\/([^/?#"'\s]+)/);
+    if (!m) {
+      throw new Error('无法识别的歌单链接，请粘贴 xiage.yiwuku.com/s/xxx 形式的链接');
+    }
+    const resp = await req(`${BASE}/s/${m[1]}`);
+    const data = parseItems(resp.data);
+    if (data.length === 0) {
+      throw new Error('该歌单未解析到歌曲，可能链接有误或已失效');
+    }
+    return data;
+  },
+
+  // ===== 导入单曲 =====
+  // 协议：importMusicItem(urlLike) -> IMusicItem
+  async importMusicItem(urlLike) {
+    const m = String(urlLike || '').match(/\/s\/([^/?#"'\s]+)/);
+    if (!m) {
+      throw new Error('无法识别的歌曲链接，请粘贴 xiage.yiwuku.com/s/xxx 形式的链接');
+    }
+    const html = await getDetail(m[1]);
+    const items = parseItems(html);
+    // 详情页 erx-m-list 第一首即该歌曲本身
+    if (items.length === 0) {
+      throw new Error('未解析到歌曲信息，可能链接有误或已失效');
+    }
+    return items[0];
+  },
+
   // ===== 获取播放直链 =====
   async getMediaSource(musicItem) {
-    const id = musicItem.id || musicItem._id;
+    const id = musicItem.id;
     const html = await getDetail(id);
     const posMatch = html.match(/songs\.php\?pos=([^"')\s]+)/);
     if (!posMatch) throw new Error('无法获取播放信息');
@@ -216,7 +296,7 @@ module.exports = {
 
   // ===== 歌词（取详情页 meta description）=====
   async getLyric(musicItem) {
-    const id = musicItem.id || musicItem._id;
+    const id = musicItem.id;
     const html = await getDetail(id);
     const m = html.match(/<meta name="description" content="([^"]*)"/);
     let raw = m ? m[1] : '';
