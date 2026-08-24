@@ -1,18 +1,22 @@
 # 我要下歌 MusicFree 插件 (xiage.yiwuku.com)
 
-将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件，支持歌单/排行榜浏览、最佳匹配搜索、在线播放、歌词。
+将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件，支持歌单/排行榜浏览、最佳匹配搜索、在线播放、歌词、**导入歌单/单曲**。
 
-> **版本 0.0.3 修复说明**：
-> - ✅ 修复「无法加载歌单」：`parseItems` 原正则写死 `<li class="sound-item">`，但站点真实结构是 `.erx-m-list` 下的裸 `<li>`，导致歌单/排行榜恒为 0 条。已改为截取 `erx-m-list` 区块内裸 `<li>`。
-> - ✅ 修复「不支持搜索」：站点服务端搜索接口（`cmd.php?act=search` / `search.php?q=`）对任意关键词均返回固定的一套「歌单合集」卡片，**搜索词被完全忽略**（站点反爬/配置问题，纯 HTTP 无法触发真实搜索）。插件改为「可浏览目录最佳匹配」：在最新歌曲 + 歌单合集名中做子串匹配，命中歌单时展开其内歌曲。
-> - ✅ 修复「自动换源失败」：原代码歌手缺省填 `'未知'`，污染跨源匹配键。现已改为取真实歌手，缺省留空，自动换源可正常匹配其它音源。
+> **版本 0.0.4 修复说明**（针对真机报错）：
+> - ✅ 修复「歌单界面 `cannot read property 'length' of undefined`」：上一版 `getTopLists` 直接返回扁平数组，但 MusicFree 协议要求返回**分组数组** `[{ title, data: [] }]`（框架读 `group.data.length`）；且 `getTopListDetail` 误用 `data` 字段，协议要求 `musicList`。两者都已对齐协议，歌单列表与详情页均可正常加载。
+> - ✅ 修复「搜索不出结果」：搜索池从仅首页 15 首扩大到**首页前 3 页（≈39 首）+ 歌单名匹配展开**，命中歌单名时展开其内全部歌曲；同时修正返回值结构（`search` 用 `data` 字段，符合协议）。
+> - ✅ 新增「导入歌单 / 导入单曲」：实现 `importMusicSheet(urlLike)` 与 `importMusicItem(urlLike)`，粘贴 `xiage.yiwuku.com/s/ID` 链接即可导入，MusicFree 因此显示导入入口。
+> - ✅ 自动换源（沿用 0.0.3）：歌手缺省留空，不填 `'未知'` 占位符，跨源匹配键干净。
+
+> **版本 0.0.3 已修复**（网页层逻辑）：`parseItems` 正则由写死的 `<li class="sound-item">` 改为截取 `.erx-m-list` 区块内裸 `<li>`，解决歌单/搜索恒为 0 条；站点服务端搜索对 HTTP 不生效，改为「可浏览目录最佳匹配」。
 
 ## 功能
 
 | 方法 | 说明 | 状态 |
 |------|------|------|
-| `getTopLists` / `getTopListDetail` | 歌单/排行榜：「最新歌曲」（首页，支持 `/page_N.html` 翻页）+ 站点「歌单合集」（每张 `/s/ID` 内含歌曲） | ✅ |
-| `search` | 可浏览目录最佳匹配搜索（最新歌曲 + 歌单名），命中歌单展开内曲 | ✅（见限制） |
+| `getTopLists` / `getTopListDetail` / `getMusicSheetInfo` | 歌单/排行榜：「最新歌曲」（首页，支持 `/page_N.html` 翻页）+ 站点「歌单合集」（每张 `/s/ID` 内含歌曲）。返回值严格对齐 MusicFree 分组/ `musicList` 契约 | ✅ |
+| `search` | 可浏览目录最佳匹配搜索（首页前 3 页最新歌曲 + 歌单名），命中歌单展开内曲 | ✅（见限制） |
+| `importMusicSheet` / `importMusicItem` | 粘贴 `xiage.yiwuku.com/s/ID` 链接导入歌单/单曲 | ✅ |
 | `getMediaSource` | 获取 CDN 直链（HTTP→HTTPS 升级） | ✅ |
 | `getLyric` | 歌词（取详情页 meta description，纯文本） | ✅ |
 
@@ -27,7 +31,7 @@
 
 ## 已知限制
 
-- **搜索为「可浏览目录最佳匹配」，非全站搜索**：站点服务端搜索对 HTTP 请求不生效（任何词都回吐固定歌单卡片），插件只能覆盖最新/热门内容（最新歌曲 + 歌单合集）。检索全站历史歌曲请直接使用网站。
+- **搜索为「可浏览目录最佳匹配」，非全站搜索**：站点服务端搜索对 HTTP 请求不生效（任何词都回吐固定歌单卡片），插件只能覆盖最新/热门内容（最新 3 页歌曲 + 歌单合集）。检索全站历史歌曲请直接使用网站。
 - 歌单合集详情页单页最多 12 首，大歌单会被截断（站点限制，无分页接口）。
 - 部分歌曲仅提供网盘（迅雷）下载、无在线播放源，此类在 `getMediaSource` 抛友好错误。
 - 歌词为纯文本，无逐行时间轴。
@@ -43,11 +47,20 @@ https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
 
 或从本地导入 `xiage.js` 文件。
 
+### 导入歌单 / 单曲
+
+插件管理 → 该插件 → 「导入歌单」/「导入单曲」→ 粘贴链接：
+
+```
+https://xiage.yiwuku.com/s/9y2ow696v21qivt162vd   （歌单链接示例）
+https://xiage.yiwuku.com/s/hgdmmiov5q8poujd6g35   （单曲所在详情页链接示例）
+```
+
 ## 测试
 
 ```bash
-# 本地验证（需 axios；MusicFree 沙箱内置）
-node verify.cjs
+# 本地验证（模拟 MusicFree 框架校验返回结构，需 axios）
+node verify2.cjs
 ```
 
 依赖：仅 `axios`（MusicFree 沙箱内置）。
