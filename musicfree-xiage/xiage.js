@@ -1,16 +1,10 @@
 // 我要下歌 (xiage.yiwuku.com) MusicFree 插件
-// 站点本质：Z-Blog 静态音乐站，歌曲播放后端为 meting API（api.qijieya.cn/meting，网易云/QQ音乐源）。
-//   - 站点歌曲详情页通过 songs.php?pos=XXX 返回 meting 播放地址：https://api.qijieya.cn/meting/?type=url&id=YYY
-//   - meting 接口再 302 跳转到网易云 CDN（m*.music.126.net/...）的真实音频
-// 逆向来源：全部来自真实站点 + meting 接口实测（axios 复现），无网络搜索/盲猜。
-//
-// 修复记录（v0.0.3~v0.0.5）：
-//  - v0.0.5 重大重构：以 meting 为统一音源后端
-//      * 播放：getMediaSource 在插件内跟随 meting 302，解析最终 CDN 直链返回，
-//        规避 MusicFree 播放器不跟随跨域 302 导致的“全部无法播放”问题（实测根因）
-//      * 搜索：改用 meting ?type=search（真实可播放结果），替换原站内小池子匹配（命中率极低→空白）
-//      * 导入：支持网易云/QQ音乐歌单链接，meting ?type=playlist 拉取（实测网易539首/QQ30首正常）
-//      * 歌词：改用 meting ?type=lrc（真实逐行 LRC），替换原 meta description 纯文本
+// 音源后端：铜钟 Tonzhon (https://tonzhon.com) —— 聚合网易云等音源
+//   - 搜索 / 歌单 / 歌词 / 封面 走 Tonzhon api.php (POST, types=search|playlist|lyric|pic)
+//   - 播放：Tonzhon types=url 当前对全部音源返回空，统一回退到网易云官方外链
+//       music.163.com/song/media/outer/url?id=<netease_id>.mp3 (302 -> 真实 CDN)，插件内跟随解析为直链
+//   - xiage 站内歌曲：经 songs.php 取 netease id，同样走外链回退
+// 逆向来源：真实站点 HTML + Tonzhon 前端 JS(ajax.js/player.js) + api.php 实测（axios 复现），无网络搜索/盲猜。
 //
 // 返回值结构严格遵循 MusicFree 插件协议：
 //  - getTopLists       -> IMusicSheetGroupItem[] = [{ title, data: IMusicSheetItem[] }]
@@ -26,7 +20,11 @@ const axios = require('axios');
 
 const BASE = 'https://xiage.yiwuku.com';
 const SONGS_PHP = BASE + '/zb_users/theme/erx_Xiage/songs.php';
-const METING = 'https://api.qijieya.cn/meting/';
+// 铜钟 Tonzhon 音源后端
+const TZ = 'https://tonzhon.com/api.php';
+// 网易云官方外链（Tonzhon 对 url 接口失效时的回退，302 跳真实 CDN）
+const NETEASE_OUTER = 'https://music.163.com/song/media/outer/url?id=';
+
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -37,9 +35,78 @@ function req(url, ref) {
   });
 }
 
-// 详情页 HTML 缓存（getMediaSource / getLyric 共用，避免重复请求）
-const _detailCache = {};
+// ===== Tonzhon api.php 统一 POST 封装 =====
+async function tzPost(types, extra) {
+  const data = Object.assign({ types }, extra || {});
+  const body = Object.entries(data)
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join('&');
+  const r = await axios.post(TZ, body, {
+    headers: {
+      'User-Agent': UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Referer: 'https://tonzhon.com/',
+    },
+    timeout: 15000,
+  });
+  return r.data;
+}
 
+// 歌手字段扁平化：Tonzhon 搜索返回 [["周杰伦,温岚"]]，网易云返回 [{name}]
+function flattenArtist(a) {
+  if (!a) return '';
+  if (typeof a === 'string') return a;
+  if (Array.isArray(a)) {
+    return a
+      .map((x) => {
+        if (typeof x === 'string') return x;
+        if (Array.isArray(x)) return x.join('/');
+        if (x && x.name) return x.name;
+        return '';
+      })
+      .filter(Boolean)
+      .join('/');
+  }
+  return '';
+}
+
+// 跟随网易云外链 302，解析最终 https CDN 直链（规避播放器不跟随跨域跳转）
+async function resolveNeteaseAudio(nid) {
+  const outer = `${NETEASE_OUTER}${nid}.mp3`;
+  try {
+    const r = await axios.get(outer, {
+      headers: { 'User-Agent': UA, Referer: 'https://music.163.com/' },
+      timeout: 15000,
+      maxRedirects: 0,
+      validateStatus: (s) => s === 200 || s === 302,
+    });
+    if (r.status === 302 && r.headers.location) {
+      return r.headers.location.replace(/^http:\/\//i, 'https://');
+    }
+    if (r.status === 200) {
+      const final = (r.request && r.request.res && r.request.res.responseUrl) || outer;
+      return final.replace(/^http:\/\//i, 'https://');
+    }
+  } catch (e) {
+    // 解析失败则退回外链本身，部分环境可直连
+  }
+  return outer.replace(/^http:\/\//i, 'https://');
+}
+
+// 用歌名 best-effort 匹配网易云 id（用于 QQ 等非网易源歌曲的播放回退）
+async function matchNeteaseByQuery(name) {
+  if (!name) return null;
+  try {
+    const arr = await tzPost('search', { source: 'netease', name, pages: 1, count: 1 });
+    const it = Array.isArray(arr) ? arr[0] : null;
+    return it && it.id ? String(it.id) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ===== xiage 站点歌单浏览（与音源无关，保留）=====
+const _detailCache = {};
 async function getDetail(id) {
   if (_detailCache[id]) return _detailCache[id];
   const resp = await req(`${BASE}/s/${id}`);
@@ -47,7 +114,6 @@ async function getDetail(id) {
   return resp.data;
 }
 
-// 时长文本 "03:44" -> 秒
 function parseDuration(text) {
   if (!text) return 0;
   const parts = text.replace(/[^\d:]/g, '').split(':').filter(Boolean);
@@ -57,7 +123,6 @@ function parseDuration(text) {
   return 0;
 }
 
-// 解析“歌曲列表”：站点真实结构为 <ul class="...erx-m-list..."> 下的裸 <li>（无 class）
 function parseItems(html) {
   const list = [];
   const blockMatch = html.match(/<ul[^>]*class="[^"]*erx-m-list[^"]*"[^>]*>([\s\S]*?)<\/ul>/);
@@ -77,7 +142,6 @@ function parseItems(html) {
     const title = titleM ? titleM[1].trim() : '';
     if (!title) continue;
     const artistM = block.match(artistRe);
-    // 歌手缺省留空，绝不填占位符，避免污染跨源自动换源匹配键
     const durM = block.match(durRe);
     list.push({
       id,
@@ -90,7 +154,6 @@ function parseItems(html) {
   return list;
 }
 
-// 解析“歌单合集”卡片
 function parsePlaylists(html) {
   const list = [];
   const itemRe =
@@ -104,7 +167,6 @@ function parsePlaylists(html) {
   return list;
 }
 
-// 抓取首页某页“最新歌曲”。page<=1 取首页，否则 /page_N.html
 async function getHomeSongs(page) {
   const url = page <= 1 ? BASE + '/' : `${BASE}/page_${page}.html`;
   try {
@@ -117,53 +179,29 @@ async function getHomeSongs(page) {
   }
 }
 
-// 从 meting 播放/歌曲 URL 中提取音源 id 与 server
-function parseMetingUrl(url) {
-  const idM = String(url).match(/[?&]id=([^&]+)/);
-  const srvM = String(url).match(/[?&]server=([^&]+)/);
-  return {
-    id: idM ? decodeURIComponent(idM[1]) : '',
-    server: srvM ? srvM[1] : 'netease',
-  };
-}
-
-// 将 meting 播放地址（type=url）解析为最终 CDN 直链
-// 关键修复：MusicFree 播放器不跟随 meting 的 302 跨域跳转，故插件内自行解析后返回 CDN 直链
-async function resolveMetingAudio(murl) {
-  const url = String(murl).replace(/^http:\/\//i, 'https://');
+// 从 xiage 站内歌曲提取 netease id（songs.php -> meting url -> id）
+async function xiageNeteaseId(xiageId) {
   try {
-    // 仅取重定向 Location，不下载音频体，最快
-    const r = await axios.get(url, {
-      headers: { 'User-Agent': UA, Referer: BASE + '/' },
-      timeout: 15000,
-      maxRedirects: 0,
-      validateStatus: (s) => s === 200 || s === 302,
-    });
-    if (r.status === 302 && r.headers.location) return r.headers.location.replace(/^http:\/\//i, 'https://');
-    if (r.status === 200) {
-      const final = r.request && r.request.res ? r.request.res.responseUrl || url : url;
-      return final.replace(/^http:\/\//i, 'https://');
-    }
+    const html = await getDetail(xiageId);
+    const posM = html.match(/songs\.php\?pos=([^"')\s]+)/);
+    if (!posM) return null;
+    const sp = await req(`${SONGS_PHP}?pos=${posM[1]}`, `${BASE}/s/${xiageId}`);
+    const sm = sp.data.match(/src:"([^"]*)"/);
+    if (!sm || !sm[1]) return null;
+    const idM = sm[1].match(/[?&]id=([^&]+)/);
+    return idM ? idM[1] : null;
   } catch (e) {
-    // 解析失败则退回原 meting 地址（部分环境可直连）
+    return null;
   }
-  return url.replace(/^http:\/\//i, 'https://');
 }
 
-// 由 meting 播放 URL 派生歌词 URL（type=url -> type=lrc）
-function lrcUrlFromMurl(murl) {
-  return String(murl).replace(/type=url/, 'type=lrc');
-}
-
-// 识别网易云/QQ音乐歌单/单曲链接，返回 { server, id }
+// 识别网易云 / QQ音乐 歌单或单曲链接 -> { server, id }
 function detectPlatform(input) {
   const s = String(input || '');
-  // 网易云：playlist?id= / #/playlist?id= / /playlist/123 / /song/123
   if (/music\.163\.com/.test(s)) {
     const m = s.match(/[?&/#]id=(\d+)/) || s.match(/\/(?:song|playlist)\/(\d+)/);
     if (m) return { server: 'netease', id: m[1] };
   }
-  // QQ音乐：路径式 /playlist/123（数字）或 /songDetail/003xxx（字母数字），兼容 ?disstid= / ?id=
   if (/y\.qq\.com|qq\.com/.test(s)) {
     const m =
       s.match(/disstid=(\d+)/) ||
@@ -176,10 +214,11 @@ function detectPlatform(input) {
 
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.5',
+  version: '0.0.6',
   author: 'tianpeng',
   srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
-  description: '我要下歌(xiage.yiwuku.com) 音乐插件：歌单浏览、meting 真实搜索/播放/歌词、网易云与QQ歌单导入',
+  description:
+    '我要下歌(xiage.yiwuku.com) 音乐插件：歌单浏览 + 铜钟Tonzhon音源(搜索/歌词/导入网易云·QQ歌单)，播放走网易云官方外链',
   cacheControl: 'no-store',
   supportedSearchType: ['music'],
 
@@ -216,56 +255,43 @@ module.exports = {
     try {
       const resp = await req(sheetItem._url);
       const songs = parseItems(resp.data);
-      return { songs, hasNext: false }; // 歌单合集单页，站点无分页接口
+      return { songs, hasNext: false };
     } catch (e) {
       return { songs: [], hasNext: false };
     }
   },
 
-  // ===== 排行榜详情 =====
   async getTopListDetail(topListItem, page = 1) {
     const { songs, hasNext } = await this._fetchSongs(topListItem, page);
-    return {
-      isEnd: songs.length === 0 || !hasNext,
-      musicList: songs,
-    };
+    return { isEnd: songs.length === 0 || !hasNext, musicList: songs };
   },
 
-  // ===== 歌单详情（导入/收藏进入时调用）=====
   async getMusicSheetInfo(sheetItem, page = 1) {
     const { songs, hasNext } = await this._fetchSongs(sheetItem, page);
-    return {
-      isEnd: songs.length === 0 || !hasNext,
-      musicList: songs,
-    };
+    return { isEnd: songs.length === 0 || !hasNext, musicList: songs };
   },
 
-  // ===== 搜索（meting 真实搜索）=====
+  // ===== 搜索（Tonzhon，netease 源）=====
   async search(query, page = 1, type) {
     if (type && type !== 'music') return { isEnd: true, data: [] };
     const q = (query || '').trim();
     if (!q) return { isEnd: true, data: [] };
     try {
-      const r = await axios.get(
-        `${METING}?type=search&id=${encodeURIComponent(q)}&limit=30&page=${page}`,
-        { headers: { 'User-Agent': UA, Referer: BASE + '/' }, timeout: 15000 }
-      );
-      const list = Array.isArray(r.data) ? r.data : [];
-      const data = list.map((it) => {
-        const { id, server } = parseMetingUrl(it.url);
-        return {
-          id: `meting_${server}_${id}`,
-          title: it.name || '',
-          artist: it.artist || '',
-          album: '',
-          artwork: it.pic || '',
-          duration: 0,
-          _murl: it.url,
-        };
-      });
+      const arr = await tzPost('search', { source: 'netease', name: q, pages: page, count: 30 });
+      const list = Array.isArray(arr) ? arr : [];
+      const data = list.map((it) => ({
+        id: `tz_${it.id}`,
+        title: it.name || '',
+        artist: flattenArtist(it.artist),
+        album: it.album || '',
+        artwork: '',
+        duration: 0,
+        _nzId: String(it.id),
+        _lyricId: String(it.lyric_id || it.id),
+        _source: it.source || 'netease',
+      }));
       return { isEnd: data.length < 30, data };
     } catch (e) {
-      // meting 不可用时降级为空，避免整体崩溃
       return { isEnd: true, data: [] };
     }
   },
@@ -276,90 +302,108 @@ module.exports = {
     if (!info) {
       throw new Error('无法识别的歌单链接，请粘贴网易云(music.163.com)或QQ音乐(y.qq.com)的歌单链接');
     }
-    const r = await axios.get(
-      `${METING}?type=playlist&id=${info.id}&server=${info.server}`,
-      { headers: { 'User-Agent': UA, Referer: BASE + '/' }, timeout: 20000 }
-    );
-    const list = Array.isArray(r.data) ? r.data : [];
-    if (!list.length) throw new Error('该歌单未解析到歌曲，可能链接有误或已失效');
-    return list.map((it) => {
-      const { id, server } = parseMetingUrl(it.url);
-      return {
-        id: `meting_${server}_${id}`,
-        title: it.name || '',
-        artist: it.artist || '',
-        album: '',
-        artwork: it.pic || '',
-        duration: 0,
-        _murl: it.url,
-      };
-    });
+    if (info.server === 'netease') {
+      const d = await tzPost('playlist', { id: info.id, source: 'netease' });
+      const tracks = (d && d.playlist && d.playlist.tracks) || [];
+      if (!tracks.length)
+        throw new Error('该网易云歌单未返回曲目，通常为私人/需登录歌单；请在网易云网页端将其设为「公开」后再导入');
+      return tracks.map((t) => ({
+        id: `tz_${t.id}`,
+        title: t.name || '',
+        artist: (t.ar || []).map((a) => a.name).join('/'),
+        album: (t.al && t.al.name) || '',
+        artwork: (t.al && t.al.picUrl) || '',
+        duration: t.dt ? Math.round(t.dt / 1000) : 0,
+        _nzId: String(t.id),
+        _lyricId: String(t.id),
+      }));
+    }
+    if (info.server === 'tencent') {
+      const d = await tzPost('playlist', { id: info.id, source: 'tencent' });
+      const cd = (d && d.data && d.data.cdlist) || [];
+      const sl = cd.length ? cd[0].songlist || [] : [];
+      if (!sl.length) throw new Error('该QQ歌单未解析到歌曲，可能链接有误或已失效（或需登录）');
+      // QQ 无可靠播放源(Tonzhon url 接口失效)，best-effort 用歌名匹配网易云播放
+      return sl.map((s) => ({
+        id: `qq_${s.mid}`,
+        title: s.name || s.title || '',
+        artist: (s.singer || []).map((a) => a.name).join('/'),
+        album: (s.album && s.album.name) || '',
+        artwork: '',
+        duration: s.interval ? Number(s.interval) : 0,
+        _nzName: s.name || s.title || '',
+        _qqMid: s.mid,
+      }));
+    }
+    throw new Error('暂不支持该平台的歌单导入');
   },
 
-  // ===== 导入单曲（网易云 / QQ音乐）=====
+  // ===== 导入单曲（网易云可靠；QQ best-effort）=====
   async importMusicItem(urlLike) {
     const info = detectPlatform(urlLike);
     if (!info) {
       throw new Error('无法识别的歌曲链接，请粘贴网易云或QQ音乐的歌曲链接');
     }
-    const r = await axios.get(
-      `${METING}?type=song&id=${info.id}&server=${info.server}`,
-      { headers: { 'User-Agent': UA, Referer: BASE + '/' }, timeout: 15000 }
-    );
-    const it = Array.isArray(r.data) ? r.data[0] : r.data;
-    if (!it || !it.url) throw new Error('未解析到歌曲信息，可能链接有误或已失效');
-    const { id, server } = parseMetingUrl(it.url);
-    return {
-      id: `meting_${server}_${id}`,
-      title: it.name || '',
-      artist: it.artist || '',
-      album: '',
-      artwork: it.pic || '',
-      duration: 0,
-      _murl: it.url,
-    };
+    if (info.server === 'netease') {
+      return {
+        id: `tz_${info.id}`,
+        title: '',
+        artist: '',
+        album: '',
+        artwork: '',
+        duration: 0,
+        _nzId: info.id,
+        _lyricId: info.id,
+      };
+    }
+    if (info.server === 'tencent') {
+      return {
+        id: `qq_${info.id}`,
+        title: '',
+        artist: '',
+        album: '',
+        artwork: '',
+        duration: 0,
+        _qqMid: info.id,
+        _nzName: '',
+      };
+    }
+    throw new Error('暂不支持该平台的单曲导入');
   },
 
-  // ===== 获取播放直链 =====
+  // ===== 播放直链 =====
   async getMediaSource(musicItem) {
-    let murl = musicItem._murl;
-    if (!murl) {
-      // xiage 站内歌曲：经 songs.php 取 meting 播放地址
-      const html = await getDetail(musicItem.id);
-      const posM = html.match(/songs\.php\?pos=([^"')\s]+)/);
-      if (!posM) throw new Error('无法获取播放信息');
-      const sp = await req(`${SONGS_PHP}?pos=${posM[1]}`, `${BASE}/s/${musicItem.id}`);
-      const sm = sp.data.match(/src:"([^"]*)"/);
-      if (!sm || !sm[1]) throw new Error('该歌曲仅提供网盘下载，暂无可在线播放的音源');
-      murl = sm[1];
+    let nid = musicItem._nzId;
+    if (!nid && musicItem._qqMid) {
+      // QQ 歌曲 best-effort：用歌名匹配网易云
+      nid = await matchNeteaseByQuery(musicItem._nzName);
     }
-    const url = await resolveMetingAudio(murl);
+    if (!nid) {
+      // xiage 站内歌曲
+      nid = await xiageNeteaseId(musicItem.id);
+    }
+    if (!nid) throw new Error('该歌曲暂无可用的播放音源（Tonzhon 当前仅网易云可播）');
+    const url = await resolveNeteaseAudio(nid);
     return { url };
   },
 
-  // ===== 歌词（meting 真实 LRC）=====
+  // ===== 歌词（Tonzhon lyric 接口，netease）=====
   async getLyric(musicItem) {
-    let murl = musicItem._murl;
-    if (!murl) {
-      try {
-        const html = await getDetail(musicItem.id);
-        const posM = html.match(/songs\.php\?pos=([^"')\s]+)/);
-        if (posM) {
-          const sp = await req(`${SONGS_PHP}?pos=${posM[1]}`, `${BASE}/s/${musicItem.id}`);
-          const sm = sp.data.match(/src:"([^"]*)"/);
-          if (sm && sm[1]) murl = sm[1];
-        }
-      } catch (e) {
-        /* 忽略，返回空歌词 */
-      }
+    let nid = musicItem._nzId;
+    let lyricId = musicItem._lyricId || nid;
+    if (!lyricId && musicItem._qqMid) {
+      nid = await matchNeteaseByQuery(musicItem._nzName);
+      lyricId = nid;
     }
-    if (!murl) return { rawLrc: '', translation: '' };
+    if (!lyricId) {
+      nid = await xiageNeteaseId(musicItem.id);
+      lyricId = nid;
+    }
+    if (!lyricId) return { rawLrc: '', translation: '' };
     try {
-      const r = await axios.get(lrcUrlFromMurl(murl), {
-        headers: { 'User-Agent': UA, Referer: BASE + '/' },
-        timeout: 15000,
-      });
-      return { rawLrc: typeof r.data === 'string' ? r.data : '', translation: '' };
+      const r = await tzPost('lyric', { id: lyricId, source: 'netease' });
+      const lrc = typeof r === 'string' ? r : (r && (r.lrc || r.lyric)) || '';
+      return { rawLrc: lrc || '', translation: '' };
     } catch (e) {
       return { rawLrc: '', translation: '' };
     }
