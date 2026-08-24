@@ -1,78 +1,55 @@
 # 我要下歌 MusicFree 插件 (xiage.yiwuku.com)
 
-将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件。站点歌曲的播放后端是 **meting API**（api.qijieya.cn/meting，对接网易云/QQ音乐源），本插件以 meting 为统一音源后端，提供：
+将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件。
+
+**音源后端：铜钟 Tonzhon（https://tonzhon.com）** —— 聚合网易云等音源的第三方 API。本插件以 Tonzhon 为元数据与搜索后端，播放统一走**网易云官方外链回退**（Tonzhon 的 `url` 接口当前对全部音源返回空，其前端自身也是回退到 `music.163.com` 外链），提供：
 
 - 歌单/排行榜浏览（xiage 站内精选）
-- **真实可播放的搜索**（meting 搜索，覆盖网易云/QQ曲库）
-- 在线播放（解析最终 CDN 直链，绕过跨域 302 跳转）
-- 逐行 LRC 歌词
+- **真实可播放的搜索**（Tonzhon 搜索，网易云曲库）
+- 在线播放（网易云外链 302 → 真实 CDN 直链，插件内解析，绕过播放器不跟随跨域跳转）
+- 逐行 LRC 歌词（Tonzhon `types=lyric`）
 - **导入网易云 / QQ音乐 歌单与单曲**
 
-> **版本 0.0.5 重大重构**（针对真机「歌曲无法播放 / 搜索空白 / 导入不支持」）：
-> - ✅ **播放修复（核心）**：原实现直接把 `meting/?type=url&id=XXX` 返回给播放器，而该地址会 `302` 跳转到网易/QQ CDN，MusicFree 播放器不跟随跨域 302 → 全部无法播放。现改为在插件内跟随 302，解析出最终 **https CDN 直链**再返回（`getMediaSource` 内 `resolveMetingAudio`）。实测 xiage 站内歌曲、搜索结果、导入歌曲均可解析并播放（audio/mpeg，206）。
-> - ✅ **搜索修复**：改用 `meting ?type=search&id=关键词`，返回真实可播放结果（实测「周杰伦」「晴天」各 30 条），替换原「站内小池子匹配」（命中率极低→空白）。
-> - ✅ **导入修复**：`importMusicSheet` / `importMusicItem` 识别网易云(`music.163.com`)、QQ音乐(`y.qq.com`)链接，走 `meting ?type=playlist` 拉取歌曲（实测网易 539 首 / QQ 30 首均正常导入并可播放）。
-> - ✅ **歌词升级**：改用 `meting ?type=lrc`，返回真实逐行 LRC（替换原 meta description 纯文本）。
-> - ✅ 自动换源：歌手缺省留空，不填占位符，跨源匹配键干净。
+> **版本 0.0.6（音源切换为铜钟 Tonzhon）**
+> - 元数据全走 Tonzhon `api.php`（POST，Meting 协议：`types=search/playlist/lyric/pic`）
+> - 播放统一走网易云官方外链 `music.163.com/song/media/outer/url?id=<netease_id>.mp3`，插件内跟随 302 解析最终 https CDN 直链
+> - 搜索固定 `source=netease`（Tonzhon 仅 netease/ws 源有搜索结果）
+> - 网易云公开歌单导入 100% 可用；QQ 歌单可解析歌名并以 best-effort 匹配网易云播放
+>
+> **版本 0.0.5 历史**：曾以 meting 为后端，因 meting 接口后续失效，0.0.6 切换为 Tonzhon。
 
 ## 功能
 
 | 方法 | 说明 | 状态 |
 |------|------|------|
-| `getTopLists` / `getTopListDetail` / `getMusicSheetInfo` | 歌单/排行榜：「最新歌曲」（首页翻页）+ 站点「歌单合集」。返回值对齐 MusicFree 分组 / `musicList` 契约 | ✅ |
-| `search` | meting 真实搜索（网易云/QQ曲库），返回可播放结果 | ✅ |
-| `importMusicSheet` / `importMusicItem` | 导入**网易云 / QQ音乐**歌单/单曲链接 | ✅ |
-| `getMediaSource` | 跟随 meting 302，解析最终 https CDN 直链 | ✅ |
-| `getLyric` | meting 逐行 LRC 歌词 | ✅ |
+| `getTopLists` / `getTopListDetail` / `getMusicSheetInfo` | 歌单/排行榜：「最新歌曲」（首页翻页）+ 站点「歌单合集」 | ✅ |
+| `search` | Tonzhon 搜索（网易云源），返回可播放结果 | ✅ |
+| `importMusicSheet` / `importMusicItem` | 导入**网易云 / QQ音乐**歌单/单曲链接 | ✅（见限制） |
+| `getMediaSource` | 网易云外链 302 → https CDN 直链 | ✅ |
+| `getLyric` | Tonzhon 逐行 LRC 歌词 | ✅ |
 
-## 逆向来源（全部真实站点 + meting 接口实测，无盲猜/网络搜索）
+## 已知限制（站点/音源侧，非插件 bug）
 
-- **浏览层（xiage 站内）**：
-  - 歌曲列表：`<ul class="...erx-m-list...">` 下的裸 `<li>` → `<a href="/s/<id>">` → 标题/歌手/时长
-  - 歌单合集：首页 `erx-list-special` 卡片 → `/s/<id>`
-  - 校内歌曲播放：`/s/<id>` 内联 `songs.php?pos=<内部索引>` → 返回 `src:"https://api.qijieya.cn/meting/?type=url&id=<metingId>"`
-- **音源层（meting API，api.qijieya.cn/meting）**：
-  - `?type=url&id=XXX` → 302 跳转至网易云 CDN（`m*.music.126.net`）或 QQ CDN（`aqqmusic.tc.qq.com`）真实音频
-  - `?type=search&id=关键词` → 歌曲数组（含 `url`/`pic`/`lrc`）
-  - `?type=playlist&id=歌单ID&server=netease|tencent` → 歌单歌曲数组
-  - `?type=lrc&id=XXX` → 逐行 LRC 文本
-  - 参数文档见 `https://api.qijieya.cn/meting/`（作者亦提示该 API 免费、可能被滥用后限流）
+1. **仅网易云可稳定播放**：Tonzhon 的 `types=url` 接口当前对全部音源返回空，唯一可靠播放是网易云官方外链。因此搜索结果、网易云歌单、xiage 站内歌曲均走网易云播放；QQ 歌曲以「歌名匹配网易云」best-effort 播放（可能匹配到同名不同唱版本）。
+2. **网易云「私人/需登录」歌单不可导入**：Tonzhon 对私人歌单（如「我喜欢的音乐」）不返回曲目列表。请先在网易云网页端将歌单设为**公开**，再复制链接导入。公开歌单（榜单、公开精选）正常导入。
+3. **搜索仅覆盖网易云曲库**：Tonzhon 对 `tencent/kugou/kuwo/baidu` 源的搜索返回 0 条，故搜索固定走 netease。
+4. **酷我、百度等音源暂不支持导入**：Tonzhon 未提供稳定后端。
 
-## 已知限制
+## 逆向来源（全部真实站点 + Tonzhon 接口实测，无盲猜）
 
-- **meting API 为第三方免费接口，存在限流/偶发不可用风险**（作者已在文档中说明）。若遇播放/搜索/导入整体失败，多为该接口临时限流，稍后重试或关注其迁移地址 `musicapi.qijieya.cn`。
-- **酷我（kuwo）歌单导入暂不支持**：meting 后端仅明确支持 `netease`（网易云）与 `tencent`（QQ音乐）两个数据源，故导入目前支持网易云与 QQ 音乐；酷我链接暂无法解析。
-- xiage 站内歌单合集详情页单页最多 12 首，大歌单会被截断（站点限制）。
-- 搜索结果 `duration` 暂为 0（meting 搜索接口不返回时长），不影响播放。
-- 播放直链为带时效的 CDN 签名地址，`cacheControl` 设为 `no-store`。
+- **浏览层（xiage 站内）**：列表项位于 `.erx-m-list` 下的裸 `<li>`（无 class），字段 `span.m`(标题)/`div.ser span`(歌手)/`span.f12.i`(时长)。
+- **Tonzhon 接口**（抓前端 `js/ajax.js`、`js/player.js` 反推 + `api.php` 实测）：
+  - 搜索：`POST api.php` `types=search&source=netease&name=<词>&pages=<页>&count=<条>` → `[{id,name,album,pic_id,url_id,lyric_id,source,artist:[["a,b"]]}]`
+  - 歌词：`types=lyric&id=<lyric_id>&source=netease` → 逐行 LRC 文本
+  - 封面：`types=pic&id=<pic_id>&source=netease` → `{url:"https://p3.music.126.net/..."}`
+  - 网易云歌单：`types=playlist&id=<歌单id>&source=netease` → `playlist.tracks[]`（公开歌单含全曲）
+  - QQ 歌单：`types=playlist&id=<歌单id>&source=tencent` → `data.cdlist[0].songlist[]`（含 `mid`/`name`/`singer`）
+  - 播放回退：Tonzhon `types=url` 当前返回空，遵循其前端逻辑回退 `https://music.163.com/song/media/outer/url?id=<netease_id>.mp3`
 
 ## 安装
 
-MusicFree → 插件管理 → 从 URL 安装 → 填入：
+MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」：
 
 ```
 https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
 ```
-
-或从本地导入 `xiage.js` 文件。
-
-### 导入歌单 / 单曲（网易云 / QQ音乐）
-
-插件管理 → 该插件 → 「导入歌单」/「导入单曲」→ 粘贴链接：
-
-```
-https://music.163.com/playlist?id=2619366284        （网易云歌单）
-https://y.qq.com/n/ryqq/playlist/7844717408         （QQ音乐歌单）
-https://y.qq.com/n/ryqq/songDetail/003MPbPj2Y23W4   （QQ音乐单曲）
-```
-
-> 也可继续导入 xiage 站内歌单：`https://xiage.yiwuku.com/s/<id>`
-
-## 测试
-
-```bash
-# 本地验证（模拟 MusicFree 框架校验返回结构 + 播放直链可达性，需 axios）
-node verify3.cjs
-```
-
-依赖：仅 `axios`（MusicFree 沙箱内置）。
