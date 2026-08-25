@@ -4,7 +4,7 @@
 //   - 搜索          : Tonzhon types=search  (source=netease)
 //   - 歌词 / 封面   : Tonzhon types=lyric / types=pic
 //   - 播放直链      : 按来源路由至各自官方后端，均直取真实可播 CDN：
-//                     ① 网易云 → weapi song/enhance/player/url（AES+RSA，crypto-js/big-integer 实现）
+//                     ① 网易云 → weapi song/enhance/player/url（纯 JS AES-128-CBC，零外部依赖，桌面/移动端通用）
 //                     ② 腾讯QQ → musicu.fcg vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播
 //                     ③ 酷狗   → wwwapi.kugou.com play/getdata
 //                     各后端失败均 best-effort 回退：按歌名匹配网易云 id 走 weapi。
@@ -27,8 +27,6 @@
 //  - getLyric          -> { rawLrc }
 
 const axios = require('axios');
-const CryptoJS = require('crypto-js');
-const bigInt = require('big-integer');
 
 // ===== 铜钟 Tonzhon 音源后端（歌单/搜索/歌词）=====
 const TZ = 'https://tonzhon.com/api.php';
@@ -123,46 +121,33 @@ function flattenArtist(a) {
   return '';
 }
 
-// ===== 网易云 weapi 播放端点（AES+RSA 加密，沙箱内置 crypto-js/big-integer 实现）=====
+// ===== 网易云 weapi 播放端点（纯 JS AES-128-CBC 实现，无任何外部依赖，桌面/移动端沙箱通用）=====
 // 说明：网易云免费外链 music.163.com/song/media/outer/url 近期被大面积限制（连热门曲都 404），
 // 而官方客户端真正取链端点 weapi/song/enhance/player/url 仍返回真实可播 CDN，故用其取代外链。
-const WEAPI_MODULUS =
-  '00e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
+// 加密为 AES-128-CBC（两次）+ RSA；原 crypto-js/big-integer 依赖在移动端沙箱缺失会导致"无法安装"，
+// 故此处改为纯 JS 实现：AES 自实现，RSA 采用【固定 secKey + 预计算 encSecKey 常量】规避运行时大数运算。
 const WEAPI_NONCE = '0CoJUm6Qyw8W8jud';
-const WEAPI_PUBKEY = '010001';
 const WEAPI_IV = '0102030405060708';
+const WEAPI_SEC_KEY = '0CoJUm6Qyw8W8jud'; // 固定外层 AES 密钥（第三方客户端通用做法）
+const WEAPI_ENC_SEC_KEY =
+  'bf50d0bcf56833b06d8d1219496a452a1d860fd58a14c0aafba3e770104ca77dc6856cb310ed3309039e6865081be4ddc2df52663373b20b70ac25b4d0c6ca466daef6b50174e93536e2d580c49e70649ad1936584899e85722eb83ceddfb4f56c1172fca5e60592d0e6ee3e8e02be1fe6e53f285b0389162d8e6ddc553857cd'; // RSA(reversed(SEC_KEY)) 预计算常量
 
-function weapiRandomKey(len) {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let s = '';
-  for (let i = 0; i < len; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
-  return s;
-}
-// AES-128-CBC（crypto-js，使用原始密钥字节，PKCS7 填充）
-function weapiAes(text, keyStr) {
-  const key = CryptoJS.enc.Utf8.parse(keyStr);
-  const iv = CryptoJS.enc.Utf8.parse(WEAPI_IV);
-  const ct = CryptoJS.AES.encrypt(text, key, {
-    iv: iv,
-    mode: CryptoJS.mode.CBC,
-    padding: CryptoJS.pad.Pkcs7,
-  });
-  return ct.toString();
-}
-// RSA: (reversed(secKey) as hex) ^ pubKey mod modulus
-function weapiRsa(text) {
-  const reversed = String(text).split('').reverse().join('');
-  const hex = Buffer.from(reversed, 'utf8').toString('hex');
-  const num = bigInt(hex, 16);
-  const e = bigInt(WEAPI_PUBKEY, 16);
-  const m = bigInt(WEAPI_MODULUS, 16);
-  return num.modPow(e, m).toString(16).padStart(256, '0');
-}
+// --- 纯 JS AES-128-CBC（PKCS7）---
+const _SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16];
+const _RCON = [0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000,0x80000000,0x1b000000,0x36000000];
+function _subWord(w){return (_SBOX[(w>>>24)&0xff]<<24)|(_SBOX[(w>>>16)&0xff]<<16)|(_SBOX[(w>>>8)&0xff]<<8)|_SBOX[w&0xff];}
+function _rotWord(w){return ((w<<8)|(w>>>24))>>>0;}
+function _keyExp(key){const Nk=4,Nr=10;const w=new Array(44);for(let i=0;i<Nk;i++)w[i]=(key[4*i]<<24)|(key[4*i+1]<<16)|(key[4*i+2]<<8)|key[4*i+3];for(let i=Nk;i<44;i++){let t=w[i-1];if(i%Nk===0)t=_subWord(_rotWord(t))^_RCON[(i/Nk)-1];w[i]=(w[i-Nk]^t)>>>0;}return w;}
+function _gfMul(a,b){let p=0;for(let i=0;i<8;i++){if(b&1)p^=a;const hi=a&0x80;a=(a<<1)&0xff;if(hi)a^=0x1b;b>>=1;}return p&0xff;}
+function _encBlock(block,w){const Nr=10;const s=block.slice();const addRK=(rnd)=>{for(let c=0;c<4;c++){const word=w[rnd*4+c];s[c*4]^=(word>>>24)&0xff;s[c*4+1]^=(word>>>16)&0xff;s[c*4+2]^=(word>>>8)&0xff;s[c*4+3]^=word&0xff;}};addRK(0);for(let r=1;r<Nr;r++){for(let i=0;i<16;i++)s[i]=_SBOX[s[i]];const sh=s.slice();for(let row=1;row<4;row++)for(let c=0;c<4;c++)s[c*4+row]=sh[((c+row)%4)*4+row];for(let c=0;c<4;c++){const i=c*4;const a0=s[i],a1=s[i+1],a2=s[i+2],a3=s[i+3];s[i]=_gfMul(a0,2)^_gfMul(a1,3)^a2^a3;s[i+1]=a0^_gfMul(a1,2)^_gfMul(a2,3)^a3;s[i+2]=a0^a1^_gfMul(a2,2)^_gfMul(a3,3);s[i+3]=_gfMul(a0,3)^a1^a2^_gfMul(a3,2);}addRK(r);}for(let i=0;i<16;i++)s[i]=_SBOX[s[i]];const sh=s.slice();for(let row=1;row<4;row++)for(let c=0;c<4;c++)s[c*4+row]=sh[((c+row)%4)*4+row];addRK(Nr);return s;}
+function _utf8Bytes(str){const out=[];for(let i=0;i<str.length;i++){let c=str.charCodeAt(i);if(c<0x80)out.push(c);else if(c<0x800){out.push(0xc0|(c>>6),0x80|(c&0x3f));}else if(c<0xd800||c>=0xe000){out.push(0xe0|(c>>12),0x80|((c>>6)&0x3f),0x80|(c&0x3f));}else{i++;c=0x10000+(((c&0x3ff)<<10)|(str.charCodeAt(i)&0x3ff));out.push(0xf0|(c>>18),0x80|((c>>12)&0x3f),0x80|((c>>6)&0x3f),0x80|(c&0x3f));}}return out;}
+function _toB64(bytes){const CH='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';let s='';for(let i=0;i<bytes.length;i+=3){const b0=bytes[i],b1=i+1<bytes.length?bytes[i+1]:0,b2=i+2<bytes.length?bytes[i+2]:0;const n=(b0<<16)|(b1<<8)|b2;s+=CH[(n>>18)&0x3f]+CH[(n>>12)&0x3f]+(i+1<bytes.length?CH[(n>>6)&0x3f]:'=')+(i+2<bytes.length?CH[n&0x3f]:'=');}return s;}
+function _pkcs7(b,bs){const p=bs-(b.length%bs);const o=b.slice();for(let i=0;i<p;i++)o.push(p);return o;}
+function _aesCbc(text,keyStr){const kb=_utf8Bytes(keyStr),ivb=_utf8Bytes(WEAPI_IV);let pt=_pkcs7(_utf8Bytes(text),16);const w=_keyExp(kb);const out=[];let prev=ivb.slice();for(let b=0;b<pt.length;b+=16){const blk=pt.slice(b,b+16).map((x,i)=>x^prev[i]);const e=_encBlock(blk,w);for(let i=0;i<16;i++)out.push(e[i]);prev=e;}return _toB64(out);}
 function weapiEncrypt(text) {
-  const secKey = weapiRandomKey(16);
-  const p1 = weapiAes(text, WEAPI_NONCE);
-  const p2 = weapiAes(p1, secKey);
-  return { params: p2, encSecKey: weapiRsa(secKey) };
+  const p1 = _aesCbc(text, WEAPI_NONCE);
+  const p2 = _aesCbc(p1, WEAPI_SEC_KEY);
+  return { params: p2, encSecKey: WEAPI_ENC_SEC_KEY };
 }
 
 // 直连网易云 weapi 取播放直链（返回 http(s) CDN；下架/变灰曲返回 null）
@@ -366,7 +351,7 @@ function detectPlatform(input) {
 
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.10',
+  version: '0.0.11',
   author: 'tianpeng',
   srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
   description:
