@@ -403,32 +403,13 @@
     };
   }
 
-  // ===== 插件导出对象 =====
-  var plugin = {
-    platform: '我要下歌',
-    version: '0.0.13',
-    author: 'tianpeng',
-    // 安装/更新地址：raw.giteeusercontent.com 直链（gitee.com/raw 会 302，虽 axios 跟随但直链更稳）
-    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
-    description:
-      '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放按来源路由至官方后端——网易云 weapi / 腾讯QQ CgiGetVkey / 酷狗 play/getdata，失败回退网易云匹配',
-    cacheControl: 'no-store',
-    supportedSearchType: ['music'],
+    // ===== 插件导出对象 =====
 
-    // ===== 排行榜 / 热门歌单（全部来自 Tonzhon playlist 接口，按平台分组）=====
-    getTopLists: function () {
-      var groups = [];
-      groups.push(buildGroup('网易云排行榜', NETEASE_RANKS, 'netease', '排行榜'));
-      groups.push(buildGroup('酷狗排行榜', KUGOU_RANKS, 'kugou', '排行榜'));
-      groups.push(buildGroup('QQ音乐歌单', QQ_RANKS, 'tencent', '排行榜'));
-      groups.push(buildGroup('热门歌单·网易云', NETEASE_HOT, 'netease', '热门歌单'));
-      groups.push(buildGroup('热门歌单·酷狗', KUGOU_HOT, 'kugou', '热门歌单'));
-      groups.push(buildGroup('热门歌单·QQ音乐', QQ_HOT, 'tencent', '热门歌单'));
-      return Promise.resolve(groups);
-    },
-
-    _fetchSongs: function (sheetItem) {
-      if (sheetItem._kind !== 'tzpl') return Promise.resolve({ songs: [], hasNext: false });
+    // 歌单/榜单详情抓取：提升为 IIFE 自由函数（与 getNeteaseUrl 等并列）。
+    // 关键修复：此前写在 plugin 对象字面量里作为属性，而 getTopListDetail/getMusicSheetInfo
+    // 用裸 _fetchSongs(...) 调用，作用域中无此自由变量 → ReferenceError → 排行榜/歌单详情为空。
+    function _fetchSongs(sheetItem) {
+      if (!sheetItem || sheetItem._kind !== 'tzpl') return Promise.resolve({ songs: [], hasNext: false });
       var src = sheetItem._src;
       try {
         if (src === 'netease') {
@@ -454,6 +435,92 @@
         return Promise.resolve({ songs: [], hasNext: false });
       }
       return Promise.resolve({ songs: [], hasNext: false });
+    }
+
+    // 试听片段探测：QQ 免费账号对部分曲（含非 VIP 的试听限制曲）经 CgiGetVkey 返回 30s 试听片段，
+    // 仅凭 CgiGetVkey 的 buy 标志无法区分（预览曲与完整曲标志完全相同，见实测），必须以「实际文件大小」判定。
+    // 用 Range GET（bytes=0-0）取响应头 content-range 的 TOTAL 字节数；aqqmusic 等 CDN 对 HEAD 不回 content-length，
+    // 但对 Range GET 稳定回 content-range: bytes 0-0/TOTAL。30s@128kbps≈500KB，完整曲通常≥2MB，阈值取 1.2MB。
+    // 无法判断（请求失败/不支持 Range）时返回 false，绝不误伤完整曲、绝不阻塞播放。
+    function looksLikePreview(url) {
+      if (!url || typeof url !== 'string') return Promise.resolve(false);
+      var u = forceHttps(url);
+      return axios
+        .get(u, {
+          headers: { 'User-Agent': UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
+          responseType: 'stream',
+          timeout: 5000,
+          validateStatus: function () { return true; }
+        })
+        .then(function (r) {
+          try { r.data.resume(); } catch (e) { /* 丢弃响应体，仅读头 */ }
+          var cr = r.headers && r.headers['content-range'];
+          if (cr) {
+            var m = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+            if (m) {
+              var total = parseInt(m[1], 10);
+              return total > 0 && total < 1.2 * 1024 * 1024;
+            }
+          }
+          // 兜底：部分 CDN 不支持 Range 时退用 content-length
+          var cl = r.headers && r.headers['content-length'] ? parseInt(r.headers['content-length'], 10) : 0;
+          return cl > 0 && cl < 1.2 * 1024 * 1024;
+        })
+        .catch(function () { return false; });
+    }
+
+    // 按歌名+歌手匹配网易云并返回「首个完整」直链（QQ/酷狗 试听或取链失败时的回退，网易云直连不产试听）。
+    // 关键点：网易云搜索结果首位常为官方版但可能已变灰（weapi 返回 url:null），个别匹配到的曲即便返回直链也可能是
+    // 试听片段（实测白月光与朱砂痣 大籽版网易云直链仅 0.94MB ≈ 试听）。故遍历前若干结果，按 Tonzhon 相关度顺序
+    // 逐个取链并排除试听片段（<1.2MB），返回首个「完整」直链；若候选全是试听/变灰，则退回最后一个非空直链（至少能播）。
+    // 实测：慢冷 Live 首位李荣浩版变灰→第 2 名梁静茹版完整 1.5MB 命中；白月光首位试听→继续命中完整版。
+    function getNeteaseUrlForQuery(name, artist) {
+      if (!name) return Promise.resolve(null);
+      return tzPost('search', { source: 'netease', name: name, pages: 1, count: 8 })
+        .then(function (arr) {
+          var list = Array.isArray(arr) ? arr : [];
+          if (!list.length) return null;
+          var lastAny = null;
+          var chain = list.reduce(function (p, it) {
+            var id = it && it.id ? String(it.id) : null;
+            if (!id) return p;
+            return p.then(function (found) {
+              if (found) return found; // 已找到完整直链，短路后续取链
+              return getNeteaseUrl(id).then(function (u) {
+                if (!u) return null;
+                lastAny = u; // 记录最近一个非空直链，供全试听时兜底
+                return looksLikePreview(u).then(function (isPrev) {
+                  return isPrev ? null : u; // 完整→命中；试听/变灰→继续下一个候选
+                });
+              });
+            });
+          }, Promise.resolve(null));
+          return chain.then(function (found) { return found || lastAny; });
+        })
+        .catch(function (e) { return null; });
+    }
+
+    var plugin = {
+      platform: '我要下歌',
+      version: '0.0.14',
+    author: 'tianpeng',
+    // 安装/更新地址：raw.giteeusercontent.com 直链（gitee.com/raw 会 302，虽 axios 跟随但直链更稳）
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
+    description:
+      '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放按来源路由至官方后端——网易云 weapi / 腾讯QQ CgiGetVkey / 酷狗 play/getdata，失败回退网易云匹配',
+    cacheControl: 'no-store',
+    supportedSearchType: ['music'],
+
+    // ===== 排行榜 / 热门歌单（全部来自 Tonzhon playlist 接口，按平台分组）=====
+    getTopLists: function () {
+      var groups = [];
+      groups.push(buildGroup('网易云排行榜', NETEASE_RANKS, 'netease', '排行榜'));
+      groups.push(buildGroup('酷狗排行榜', KUGOU_RANKS, 'kugou', '排行榜'));
+      groups.push(buildGroup('QQ音乐歌单', QQ_RANKS, 'tencent', '排行榜'));
+      groups.push(buildGroup('热门歌单·网易云', NETEASE_HOT, 'netease', '热门歌单'));
+      groups.push(buildGroup('热门歌单·酷狗', KUGOU_HOT, 'kugou', '热门歌单'));
+      groups.push(buildGroup('热门歌单·QQ音乐', QQ_HOT, 'tencent', '热门歌单'));
+      return Promise.resolve(groups);
     },
 
     getTopListDetail: function (topListItem, page) {
@@ -568,15 +635,19 @@
           return _fallback(musicItem);
         });
       }
-      // ② 腾讯QQ 源：官方 CgiGetVkey 取链；失败回退网易云匹配
+      // ② 腾讯QQ 源：官方 CgiGetVkey 取链。免费账号对 VIP/付费曲返回 30s 试听，
+      //    故探测文件大小，疑似试听则回退网易云完整版（完整 QQ 曲仍走 QQ，保留原格式）。
       if (musicItem._qqMid) {
         return getQQUrl(musicItem._qqMid).then(function (url) {
-          if (url) return { url: forceHttps(url) };
-          return matchNeteaseByQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist)
-            .then(function (nid) {
-              if (nid) return getNeteaseUrl(nid).then(function (nu) { return nu ? { url: forceHttps(nu) } : _fallback(musicItem); });
-              return _fallback(musicItem);
-            });
+          if (!url) {
+            return getNeteaseUrlForQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist)
+              .then(function (nu) { return nu ? { url: forceHttps(nu) } : _fallback(musicItem); });
+          }
+          return looksLikePreview(url).then(function (isPrev) {
+            if (!isPrev) return { url: forceHttps(url) };
+            return getNeteaseUrlForQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist)
+              .then(function (nu) { return nu ? { url: forceHttps(nu) } : { url: forceHttps(url) }; });
+          });
         });
       }
       // ③ 酷狗源：官方 play/getdata 取链；失败回退网易云匹配
