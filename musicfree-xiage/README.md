@@ -16,15 +16,24 @@
 - **逐行 LRC 歌词**（Tonzhon `types=lyric`）
 - **导入网易云 / QQ音乐 歌单与单曲**
 
-> **版本 0.0.12（移动端"插件无法解析"真正根因修复：安装地址 302 重定向）**
-> 现象：v0.0.11 仍"移动端无法安装，提示插件无法解析"。
-> 根因（已用 `vm` 沙箱加载测试 + 网络探测实证）：**插件代码本身无任何问题**——在 MusicFree 同款 `vm` 沙箱中可零异常加载、9 个方法全部导出。真正的根因是**安装地址 `gitee.com/.../raw/master/...` 返回 HTTP 302**，重定向到带签名的 `raw.giteeusercontent.com?metadata=...&signature=...`。桌面端（Electron/axios）会跟随 302 拿到真实 JS 故可装；**移动端 MusicFree 的 HTTP 桥不跟随重定向，直接把重定向 HTML 当 JS 解析 → 报"插件无法解析"**。v0.0.11 移除 crypto-js/big-integer/Buffer 依赖是误判（沙箱本就内置这些模块），故无效。
-> 修复：将 `srcUrl` 与给用户粘贴的安装地址改为**不重定向的 CDN 直链** `https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js`（实测返回 `200 text/plain`、22817 字节真实 JS）。移动端将正常安装。纯 JS 加密实现保留（无害且更通用）。
+> **版本 0.0.13（移动端"插件无法解析"真正修复：跨加载器协议兼容 IIFE）**
+> 现象：v0.0.11 / v0.0.12 桌面端可装，**移动端本地安装仍报"插件无法解析"**。
+> 根因（已用与 MusicFree 真实加载器**完全一致**的 `Function(body)()` 外壳复现并定位）：MusicFree 的插件加载器有两种协议形态——
+>   - (A) 新协议 CommonJS：沙箱注入 `module`/`exports`，期望插件写 `module.exports = {...}`；
+>   - (B) 老式协议 `return ${funcCode}`：把整段源码当**表达式**直接 `return`，且**不注入 `module`/`exports`**。
+> 旧版插件（v0.0.11/0.0.12）仅写 `module.exports = {...}`。在(B)类加载器下 `module` 未定义 → `ReferenceError: module is not defined` → 被 `mountPlugin` 捕获为 `PluginErrorReason.CannotParse` → 报"插件无法解析"。**这正是用户判定"非 302、而是代码依赖/语法"所指的依赖**——依赖了一个沙箱未注入的 `module` 全局。
+> 修复：整个插件改写为 **IIFE 表达式** `(function(){ ... return plugin; })()`，三路导出兼容两种协议：
+>   1. 注入 `module` 的环境 → `module.exports = plugin`（兼容 A）；
+>   2. 注入 `exports` 的环境 → `exports.default = plugin`（兼容 A 的 `.default` 读取分支）；
+>   3. 不注入 `module`/`exports` 的老式 `return funcCode` 环境 → IIFE 作为表达式被 `return`，返回 `plugin`（兼容 B）。
+>   同时 `require` 用 `typeof __musicfree_require !== 'undefined' ? __musicfree_require : require` 安全取用，避免依赖具体注入名。
+> 验证：用 `new Function("'use strict'; return function(require,__musicfree_require,module,exports,console,env,URL,process){ "+源码+" }")()` 严格复现真实加载器——在「注入 module」与「不注入 module」两种环境下均 **9/9 方法导出成功**；并经 `hermes-parser`（Hermes 引擎规范）与 `esprima` ES2017 双重解析验证无语法问题。
 >
-> **版本 0.0.11（移动端安装修复：移除 crypto-js / big-integer / Buffer 依赖）【此判定已被 v0.0.12 更正为误判】**
-> 现象：v0.0.10 桌面端可正常安装，移动端（Android/iOS 沙箱）无法安装。
-> 原判根因：插件顶部 `require('crypto-js')` 与 `require('big-integer')` 在**模块加载阶段**执行，移动端沙箱未打包这两模块（且 `Buffer` 在 Hermes 移动端为 undefined），`require` 抛错直接导致安装失败；桌面端（Electron/Node）能正常解析故可装。
-> 原修复：彻底移除三项外部依赖，网易云 weapi 加密改为**纯 JS 实现**。⚠️ 事后经 `vm` 沙箱实证：沙箱其实内置 crypto-js/big-integer/Buffer，且插件代码本身可零异常加载，故该"根因"不成立——v0.0.11 未能解决移动端安装。真正根因是下方 v0.0.12 所述的安装地址 302 重定向。
+> **版本 0.0.12（仅改安装地址为 CDN 直链）【此结论已被 v0.0.13 更正：302 非根因】**
+> 现象：v0.0.11 移动端仍无法安装。原误判为安装地址 `gitee.com/raw` 的 **302 重定向**导致移动端拿到 HTML。但用户实测确认 302 并非根因（且本地安装本就无 302；网络安装时 axios 默认跟随 302），故该修复只是无害的次要优化，未触及真正问题。真正根因为上方 v0.0.13 所述的**加载器协议不兼容**。
+>
+> **版本 0.0.11（移除 crypto-js / big-integer / Buffer 依赖）【此判定同样非根因】**
+> 原判移动端沙箱缺 crypto-js/big-integer/Buffer。经 `vm` 沙箱与真实加载器复现，沙箱其实内置这些模块、且代码本身可零异常加载——故该"根因"不成立。其纯 JS 加密实现被 v0.0.13 保留（无害且更通用），但移除依赖本身并非修复关键。
 >
 > **版本 0.0.10（多音源播放后端：QQ/酷狗原生取链）**
 > 根因：v0.0.9 仅网易云走 weapi，酷狗/QQ 歌曲仍靠「歌名 best-effort 匹配网易云」回退——但用户收藏集以 QQ 源为主，这些歌在网易云多已变灰（诊断抽样 0 错配、100% 真变灰），故实际可播率仍低。
@@ -93,10 +102,12 @@
 
 ## 安装
 
-MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」。**请使用下方 CDN 直链**（不要用 `gitee.com/.../raw/` 链接，它会 302 重定向，导致移动端报"插件无法解析"）：
+MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」或「从本地文件安装」。
+
+**推荐使用下方 CDN 直链**（无 302 重定向，最稳妥）：
 
 ```
 https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
 ```
 
-> 备注：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js` 也能用，但会在桌面端正常、移动端因 302 不跟随而失败。始终用上面的 `raw.giteeusercontent.com` 直链最稳妥。
+> 说明：v0.0.13 已从**代码层面**修复移动端"插件无法解析"（跨加载器协议兼容 IIFE，详见上方版本说明）。若仍用旧版 `gitee.com/.../raw/` 链接，桌面端可装、移动端因 302 不跟随可能异常；故统一用上面的 `raw.giteeusercontent.com` 直链最稳妥。本地安装请直接加载本仓库 `musicfree-xiage/xiage.js`（v0.0.13+）。
