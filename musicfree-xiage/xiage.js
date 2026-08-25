@@ -124,8 +124,10 @@ function flattenArtist(a) {
 // ===== 网易云 weapi 播放端点（纯 JS AES-128-CBC 实现，无任何外部依赖，桌面/移动端沙箱通用）=====
 // 说明：网易云免费外链 music.163.com/song/media/outer/url 近期被大面积限制（连热门曲都 404），
 // 而官方客户端真正取链端点 weapi/song/enhance/player/url 仍返回真实可播 CDN，故用其取代外链。
-// 加密为 AES-128-CBC（两次）+ RSA；原 crypto-js/big-integer 依赖在移动端沙箱缺失会导致"无法安装"，
-// 故此处改为纯 JS 实现：AES 自实现，RSA 采用【固定 secKey + 预计算 encSecKey 常量】规避运行时大数运算。
+// 加密为 AES-128-CBC（两次）+ RSA；为最大化沙箱可移植性（避免依赖 crypto-js/big-integer，桌面/移动端通用），
+// 此处采用纯 JS 实现：AES 自实现，RSA 采用【固定 secKey + 预计算 encSecKey 常量】规避运行时大数运算。
+// 注：v0.0.11 曾误判"移动端沙箱缺失模块"为安装失败根因；真实根因为 srcUrl 的 302 重定向（见下方 srcUrl 注释），
+// 已于 v0.0.12 改用 raw.giteeusercontent.com 直链修复。纯 JS 实现予以保留（无害且更通用）。
 const WEAPI_NONCE = '0CoJUm6Qyw8W8jud';
 const WEAPI_IV = '0102030405060708';
 const WEAPI_SEC_KEY = '0CoJUm6Qyw8W8jud'; // 固定外层 AES 密钥（第三方客户端通用做法）
@@ -351,9 +353,11 @@ function detectPlatform(input) {
 
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.11',
+  version: '0.0.12',
   author: 'tianpeng',
-  srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
+  // ⚠️ 安装/更新地址必须用 raw.giteeusercontent.com 直链：gitee.com/.../raw/... 会 302 重定向到带签名 URL，
+  // 移动端 MusicFree 的 HTTP 桥不跟随重定向，会拿到重定向 HTML 而报"插件无法解析"。此直链返回 200 text/plain。
+  srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
   description:
     '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放按来源路由至官方后端——网易云 weapi / 腾讯QQ CgiGetVkey / 酷狗 play/getdata，失败回退网易云匹配',
   cacheControl: 'no-store',
