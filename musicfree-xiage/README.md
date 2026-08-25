@@ -16,6 +16,13 @@
 - **逐行 LRC 歌词**（Tonzhon `types=lyric`）
 - **导入网易云 / QQ音乐 歌单与单曲**
 
+> **版本 0.0.14（修复：①排行榜歌单为空 ②部分 QQ 曲仅 30s 试听）**
+> **① 排行榜为空**：v0.0.13 将插件改写为 IIFE 后，`_fetchSongs` 仅作为 `plugin` 对象字面量属性存在，而 `getTopListDetail` / `getMusicSheetInfo` 用裸标识符 `_fetchSongs(...)` 调用 → IIFE 作用域内找不到 → `ReferenceError: _fetchSongs is not defined` → 排行榜/歌单详情返回空。修复：将 `_fetchSongs` **提升为 IIFE 作用域自由函数**（删除对象字面量内属性），两处调用即生效。验证 `getTopListDetail` 现返回 100 首（云音乐飙升榜）。
+> **② 部分 QQ 曲仅 30s**：QQ 免费账号经 CgiGetVkey 对部分曲（含非 VIP 的试听限制曲）返回 30s 试听片段；且仅凭 CgiGetVkey 的 buy 标志**无法区分**试听与完整（实测慢冷 Live 与空气变软标志完全相同）。修复为两道保险：
+>   - **QQ 试听识别**：`looksLikePreview` 由 HEAD 改为 **Range GET**（`Range: bytes=0-0` 读 `content-range` 的 TOTAL 字节），aqqmusic 对 HEAD 不回 content-length、但对 Range GET 稳定回 `content-range: bytes 0-0/TOTAL`；`total < 1.2MB` 判为试听（30s@128kbps≈500KB，完整曲≥2MB），命中即回退网易云完整版；完整 QQ 曲保留原链。
+>   - **网易云回退提质**：原 `matchNeteaseByQuery` 仅取搜索第 1 名，若其变灰（weapi 返回 `url:null`）则整体回退失败、退回 30s QQ 试听。改为 `getNeteaseUrlForQuery` **遍历前 8 个搜索结果、逐个取链并排除试听片段，返回首个完整直链**；候选全为试听/变灰时退守最后一个非空直链（至少可播）。实测：慢冷 Live 首位李荣浩版变灰→第 2 名梁静茹版 1.5MB 命中；白月光与朱砂痣 大籽版网易云原直链仅 0.94MB（试听）→ 继续命中完整版 1.9MB。
+> 验证：慢冷 Live / 白月光 → 网易云完整（1.5/1.9MB）；空气变软 → 保留 QQ 完整（2.8MB）；20 首 QQ 曲抽样 0 试听、0 失败、4 首走 QQ 完整、16 首因 QQ 免费账号版权拦截走网易云回退且均成功拿到完整版。
+>
 > **版本 0.0.13（移动端"插件无法解析"真正修复：跨加载器协议兼容 IIFE）**
 > 现象：v0.0.11 / v0.0.12 桌面端可装，**移动端本地安装仍报"插件无法解析"**。
 > 根因（已用与 MusicFree 真实加载器**完全一致**的 `Function(body)()` 外壳复现并定位）：MusicFree 的插件加载器有两种协议形态——
@@ -110,4 +117,4 @@ MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」或�
 https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
 ```
 
-> 说明：v0.0.13 已从**代码层面**修复移动端"插件无法解析"（跨加载器协议兼容 IIFE，详见上方版本说明）。若仍用旧版 `gitee.com/.../raw/` 链接，桌面端可装、移动端因 302 不跟随可能异常；故统一用上面的 `raw.giteeusercontent.com` 直链最稳妥。本地安装请直接加载本仓库 `musicfree-xiage/xiage.js`（v0.0.13+）。
+> 说明：v0.0.13 已从**代码层面**修复移动端"插件无法解析"（跨加载器协议兼容 IIFE，详见上方版本说明）；v0.0.14 进一步修复排行榜为空与部分 QQ 曲仅 30s 试听（详见上方版本说明）。若仍用旧版 `gitee.com/.../raw/` 链接，桌面端可装、移动端因 302 不跟随可能异常；故统一用上面的 `raw.giteeusercontent.com` 直链最稳妥。本地安装请直接加载本仓库 `musicfree-xiage/xiage.js`（v0.0.14+）。
