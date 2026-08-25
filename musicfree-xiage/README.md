@@ -16,10 +16,15 @@
 - **逐行 LRC 歌词**（Tonzhon `types=lyric`）
 - **导入网易云 / QQ音乐 歌单与单曲**
 
-> **版本 0.0.11（移动端安装修复：移除 crypto-js / big-integer / Buffer 依赖）**
+> **版本 0.0.12（移动端"插件无法解析"真正根因修复：安装地址 302 重定向）**
+> 现象：v0.0.11 仍"移动端无法安装，提示插件无法解析"。
+> 根因（已用 `vm` 沙箱加载测试 + 网络探测实证）：**插件代码本身无任何问题**——在 MusicFree 同款 `vm` 沙箱中可零异常加载、9 个方法全部导出。真正的根因是**安装地址 `gitee.com/.../raw/master/...` 返回 HTTP 302**，重定向到带签名的 `raw.giteeusercontent.com?metadata=...&signature=...`。桌面端（Electron/axios）会跟随 302 拿到真实 JS 故可装；**移动端 MusicFree 的 HTTP 桥不跟随重定向，直接把重定向 HTML 当 JS 解析 → 报"插件无法解析"**。v0.0.11 移除 crypto-js/big-integer/Buffer 依赖是误判（沙箱本就内置这些模块），故无效。
+> 修复：将 `srcUrl` 与给用户粘贴的安装地址改为**不重定向的 CDN 直链** `https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js`（实测返回 `200 text/plain`、22817 字节真实 JS）。移动端将正常安装。纯 JS 加密实现保留（无害且更通用）。
+>
+> **版本 0.0.11（移动端安装修复：移除 crypto-js / big-integer / Buffer 依赖）【此判定已被 v0.0.12 更正为误判】**
 > 现象：v0.0.10 桌面端可正常安装，移动端（Android/iOS 沙箱）无法安装。
-> 根因：插件顶部 `require('crypto-js')` 与 `require('big-integer')` 在**模块加载阶段**执行，移动端沙箱未打包这两模块（且 `Buffer` 在 Hermes 移动端为 undefined），`require` 抛错直接导致安装失败；桌面端（Electron/Node）能正常解析故可装。
-> 修复：彻底移除三项外部依赖，网易云 weapi 加密改为**纯 JS 实现**——AES-128-CBC 自实现（与 crypto-js / Node `crypto` 逐字节一致，已用 FIPS 测试向量 + 真实取链验证）；RSA 采用**固定 secKey + 预计算 encSecKey 常量**（第三方客户端通用做法），运行时零大数运算。插件现在仅依赖 `axios`（桌面/移动端沙箱均内置）。线上 `xiage.js` 经 `require` 加载验证无报错（与移动端安装逻辑一致）。
+> 原判根因：插件顶部 `require('crypto-js')` 与 `require('big-integer')` 在**模块加载阶段**执行，移动端沙箱未打包这两模块（且 `Buffer` 在 Hermes 移动端为 undefined），`require` 抛错直接导致安装失败；桌面端（Electron/Node）能正常解析故可装。
+> 原修复：彻底移除三项外部依赖，网易云 weapi 加密改为**纯 JS 实现**。⚠️ 事后经 `vm` 沙箱实证：沙箱其实内置 crypto-js/big-integer/Buffer，且插件代码本身可零异常加载，故该"根因"不成立——v0.0.11 未能解决移动端安装。真正根因是下方 v0.0.12 所述的安装地址 302 重定向。
 >
 > **版本 0.0.10（多音源播放后端：QQ/酷狗原生取链）**
 > 根因：v0.0.9 仅网易云走 weapi，酷狗/QQ 歌曲仍靠「歌名 best-effort 匹配网易云」回退——但用户收藏集以 QQ 源为主，这些歌在网易云多已变灰（诊断抽样 0 错配、100% 真变灰），故实际可播率仍低。
@@ -88,8 +93,10 @@
 
 ## 安装
 
-MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」：
+MusicFree → 设置 → 插件设置 → 添加「从网络链接安装」。**请使用下方 CDN 直链**（不要用 `gitee.com/.../raw/` 链接，它会 302 重定向，导致移动端报"插件无法解析"）：
 
 ```
-https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
+https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
 ```
+
+> 备注：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js` 也能用，但会在桌面端正常、移动端因 302 不跟随而失败。始终用上面的 `raw.giteeusercontent.com` 直链最稳妥。
