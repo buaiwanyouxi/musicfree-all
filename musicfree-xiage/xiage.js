@@ -3,11 +3,12 @@
 //   - 歌单/排行榜  : Tonzhon types=playlist（网易云/酷狗/QQ 三源）
 //   - 搜索          : Tonzhon types=search  (source=netease)
 //   - 歌词 / 封面   : Tonzhon types=lyric / types=pic
-//   - 播放直链      : 网易云 weapi 官方端点 song/enhance/player/url 直取可播 CDN（AES+RSA 加密，
-//                     沙箱内置 crypto-js/big-integer 实现），绕开已失效的 outer/url 免费外链。
-//                     非网易源（酷狗/QQ）best-effort 匹配网易云 id 后同样走 weapi。
-// 说明：网易云免费外链 music.163.com/song/media/outer/url 近期被大面积限制（热门曲也 404），
-//      故改用官方客户端真正使用的 weapi 取链端点，可播率从约 36% 提升至约 90%+。
+//   - 播放直链      : 按来源路由至各自官方后端，均直取真实可播 CDN：
+//                     ① 网易云 → weapi song/enhance/player/url（AES+RSA，crypto-js/big-integer 实现）
+//                     ② 腾讯QQ → musicu.fcg vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播
+//                     ③ 酷狗   → wwwapi.kugou.com play/getdata
+//                     各后端失败均 best-effort 回退：按歌名匹配网易云 id 走 weapi。
+// 说明：网易云免费外链 outer/url 近期大面积限制，故网易云改用 weapi；QQ/酷狗亦各自直连官方取链端点。
 //
 // ⚠️ 已知后端限制（Tonzhon 实测）：
 //   - 汽水(qishui)/抖音：Tonzhon 无此源，静默回退网易云，无法提供真实汽水内容。
@@ -211,15 +212,75 @@ async function tzAudioUrl(id, source) {
 }
 
 // 用歌名 best-effort 匹配网易云 id（用于非网易源歌曲的播放/歌词回退）
-async function matchNeteaseByQuery(name) {
+async function matchNeteaseByQuery(name, artist) {
   if (!name) return null;
+  const tryQuery = async (q) => {
+    try {
+      const arr = await tzPost('search', { source: 'netease', name: q, pages: 1, count: 1 });
+      const it = Array.isArray(arr) ? arr[0] : null;
+      return it && it.id ? String(it.id) : null;
+    } catch (e) {
+      return null;
+    }
+  };
+  let id = await tryQuery(name);
+  if (!id && artist) id = await tryQuery(name + ' ' + artist);
+  return id;
+}
+
+// ===== 腾讯QQ 音频后端：musicu.fcg vkey.GetVkeyServer (CgiGetVkey) =====
+// 经实测：QQ 官方取链接口，无需登录即可返回真实可播直链（aqqmusic.tc.qq.com/...?vkey=...）。
+async function getQQUrl(mid) {
+  if (!mid) return null;
   try {
-    const arr = await tzPost('search', { source: 'netease', name, pages: 1, count: 1 });
-    const it = Array.isArray(arr) ? arr[0] : null;
-    return it && it.id ? String(it.id) : null;
-  } catch (e) {
-    return null;
-  }
+    const data = {
+      req_0: {
+        module: 'vkey.GetVkeyServer',
+        method: 'CgiGetVkey',
+        param: {
+          guid: String(Math.floor(Math.random() * 1e10)).padStart(10, '0'),
+          songmid: [String(mid)],
+          songtype: [0],
+          uin: '0',
+          loginflag: 1,
+          platform: '20',
+        },
+      },
+      comm: { uin: 0, format: 'json', ct: 24, cv: 0 },
+    };
+    const url =
+      'https://u.y.qq.com/cgi-bin/musicu.fcg?-=getplaysongvkey&g_tk=5381&loginUin=0&hostUin=0' +
+      '&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq&needNewCode=0' +
+      '&data=' + encodeURIComponent(JSON.stringify(data));
+    const r = await axios.get(url, { headers: { 'User-Agent': UA, Referer: 'https://y.qq.com/' }, timeout: 12000 });
+    const v = r.data && r.data.req_0 && r.data.req_0.data;
+    if (v) {
+      const sip = (v.sip && v.sip[0]) || '';
+      const info = (v.midurlinfo && v.midurlinfo[0]) || {};
+      const purl = info.purl || '';
+      if (purl) return forceHttps(sip + purl);
+    }
+  } catch (e) {}
+  return null;
+}
+
+// ===== 酷狗音频后端：wwwapi.kugou.com play/getdata =====
+// 说明：免费曲可返回 play_url；付费/区域限制曲为空，此时回退网易云匹配。
+async function getKugouUrl(hash, albumId) {
+  if (!hash) return null;
+  try {
+    const url =
+      'https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash=' + hash +
+      '&album_id=' + (albumId || '') +
+      '&dfid=&mid=286974383886022203545511837994020015101&platid=4';
+    const r = await axios.get(url, { headers: { 'User-Agent': UA, Referer: 'https://www.kugou.com/' }, timeout: 12000 });
+    const d = r.data && r.data.data;
+    if (d) {
+      const u = d.play_url || d.url || d.play_backup_url;
+      if (u) return forceHttps(u);
+    }
+  } catch (e) {}
+  return null;
 }
 
 // ===== 各源歌曲映射 =====
@@ -305,11 +366,11 @@ function detectPlatform(input) {
 
 module.exports = {
   platform: '我要下歌',
-  version: '0.0.9',
+  version: '0.0.10',
   author: 'tianpeng',
   srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js',
   description:
-    '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放直连网易云 weapi 官方端点取可播直链（绕开失效外链，可播率约90%+）',
+    '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放按来源路由至官方后端——网易云 weapi / 腾讯QQ CgiGetVkey / 酷狗 play/getdata，失败回退网易云匹配',
   cacheControl: 'no-store',
   supportedSearchType: ['music'],
 
@@ -447,28 +508,37 @@ module.exports = {
     throw new Error('暂不支持该平台的单曲导入');
   },
 
-  // ===== 播放直链（网易云 weapi 直取可播 CDN；非网易源 best-effort 匹配）=====
+  // ===== 播放直链（按来源路由至各自官方后端；失败 best-effort 匹配网易云）=====
   async getMediaSource(musicItem) {
-    // ① 网易源（含匹配得到的网易云 id）：weapi 直取真实可播直链
+    // ① 网易源：weapi 直取真实可播 CDN
     if (musicItem._nzId) {
       const url = await getNeteaseUrl(musicItem._nzId);
       if (url) return { url: forceHttps(url) };
     }
 
-    // ② 非网易源（酷狗/QQ）：先试 Tonzhon types=url，失效则 best-effort 匹配网易云 id 走 weapi
-    if (musicItem._qqMid || musicItem._kgHash) {
-      const id = musicItem._qqMid || musicItem._kgHash;
-      const src = musicItem._src || 'tencent';
-      const tz = await tzAudioUrl(id, src);
-      if (tz) return { url: tz };
-      const nid = await matchNeteaseByQuery(musicItem._name || musicItem.title);
+    // ② 腾讯QQ 源：官方 CgiGetVkey 取链（实测 12/12 可播）；失败回退网易云匹配
+    if (musicItem._qqMid) {
+      const url = await getQQUrl(musicItem._qqMid);
+      if (url) return { url: forceHttps(url) };
+      const nid = await matchNeteaseByQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist);
       if (nid) {
-        const url = await getNeteaseUrl(nid);
-        if (url) return { url: forceHttps(url) };
+        const nu = await getNeteaseUrl(nid);
+        if (nu) return { url: forceHttps(nu) };
       }
     }
 
-    // ③ 最后再试一次 Tonzhon 自有音源（若该接口未来复活）
+    // ③ 酷狗源：官方 play/getdata 取链；失败回退网易云匹配
+    if (musicItem._kgHash) {
+      const url = await getKugouUrl(musicItem._kgHash, musicItem._kgAlbum);
+      if (url) return { url: forceHttps(url) };
+      const nid = await matchNeteaseByQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist);
+      if (nid) {
+        const nu = await getNeteaseUrl(nid);
+        if (nu) return { url: forceHttps(nu) };
+      }
+    }
+
+    // ④ Tonzhon 自有音源（若未来复活）
     const fallbackId = musicItem._nzId || musicItem._qqMid || musicItem._kgHash;
     if (fallbackId) {
       const src =
@@ -478,7 +548,7 @@ module.exports = {
     }
 
     throw new Error(
-      '该歌曲暂无可用的播放音源（网易云 weapi 未返回直链，通常因该曲在网易云已下架/变灰，或匹配未命中）'
+      '该歌曲暂无可用的播放音源（QQ/酷狗/网易云后端均未返回直链；付费或区域限制曲可能无解，或匹配未命中）'
     );
   },
 
@@ -487,7 +557,7 @@ module.exports = {
     let lyricId = musicItem._lyricId || musicItem._nzId;
     // 非网易源：best-effort 匹配网易云 id 取歌词
     if (!lyricId && (musicItem._qqMid || musicItem._kgHash || musicItem._name)) {
-      const nid = await matchNeteaseByQuery(musicItem._name || musicItem.title);
+      const nid = await matchNeteaseByQuery(musicItem._name || musicItem.title, musicItem._artist || musicItem.artist);
       lyricId = nid;
     }
     if (!lyricId) return { rawLrc: '', translation: '' };
