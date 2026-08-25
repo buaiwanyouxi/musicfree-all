@@ -2,20 +2,25 @@
 
 将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件。
 
-**音源后端：铜钟 Tonzhon（https://tonzhon.com）承担歌单/搜索/歌词；播放按歌曲来源路由至各自官方后端取可播直链。** 歌单(排行榜)/热门歌单、搜索、歌词、封面、导入均经 Tonzhon `api.php`；播放按来源路由：① 网易云 → weapi `song/enhance/player/url`（AES+RSA，沙箱内置 crypto-js/big-integer）；② 腾讯QQ → `musicu.fcg` vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播；③ 酷狗 → `wwwapi.kugou.com` play/getdata。各后端失败均 best-effort 回退「按歌名匹配网易云 weapi」。
+**音源后端：铜钟 Tonzhon（https://tonzhon.com）承担歌单/搜索/歌词；播放按歌曲来源路由至各自官方后端取可播直链。** 歌单(排行榜)/热门歌单、搜索、歌词、封面、导入均经 Tonzhon `api.php`；播放按来源路由：① 网易云 → weapi `song/enhance/player/url`（纯 JS AES-128-CBC 实现，零外部依赖，桌面/移动端通用）；② 腾讯QQ → `musicu.fcg` vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播；③ 酷狗 → `wwwapi.kugou.com` play/getdata。各后端失败均 best-effort 回退「按歌名匹配网易云 weapi」。
 
 提供：
 
 - **排行榜 / 热门歌单（按平台分组）**：网易云（官方榜 + 精选）、酷狗（官方榜 + 精选）、QQ音乐（精选/每日榜单）。各分组 ID 均经 Tonzhon 实测可返回曲目。
 - **真实可播放的搜索**（Tonzhon 搜索，网易云曲库）
 - **在线播放（v0.0.10 多后端）**：按歌曲来源路由至官方后端取真实可播直链——
-  - 网易云：weapi `song/enhance/player/url`（AES-128-CBC + RSA，沙箱内置 crypto-js/big-integer）。
+  - 网易云：weapi `song/enhance/player/url`（AES-128-CBC 纯 JS 实现，零外部依赖；RSA 采用固定 secKey + 预计算 encSecKey 常量，避免在移动端沙箱做大数运算）。
   - 腾讯QQ：`musicu.fcg` vkey.GetVkeyServer (CgiGetVkey)，无需登录即可返回 `aqqmusic.tc.qq.com/...?vkey=` 直链（实测 12/12 可播）。
   - 酷狗：`wwwapi.kugou.com` play/getdata 返回 `play_url`。
   - 任一后端失败均 best-effort 回退「按歌名(+歌手)匹配网易云 weapi」；Tonzhon 自有 `types=url` 作为最后兜底（若该接口未来复活）。
 - **逐行 LRC 歌词**（Tonzhon `types=lyric`）
 - **导入网易云 / QQ音乐 歌单与单曲**
 
+> **版本 0.0.11（移动端安装修复：移除 crypto-js / big-integer / Buffer 依赖）**
+> 现象：v0.0.10 桌面端可正常安装，移动端（Android/iOS 沙箱）无法安装。
+> 根因：插件顶部 `require('crypto-js')` 与 `require('big-integer')` 在**模块加载阶段**执行，移动端沙箱未打包这两模块（且 `Buffer` 在 Hermes 移动端为 undefined），`require` 抛错直接导致安装失败；桌面端（Electron/Node）能正常解析故可装。
+> 修复：彻底移除三项外部依赖，网易云 weapi 加密改为**纯 JS 实现**——AES-128-CBC 自实现（与 crypto-js / Node `crypto` 逐字节一致，已用 FIPS 测试向量 + 真实取链验证）；RSA 采用**固定 secKey + 预计算 encSecKey 常量**（第三方客户端通用做法），运行时零大数运算。插件现在仅依赖 `axios`（桌面/移动端沙箱均内置）。线上 `xiage.js` 经 `require` 加载验证无报错（与移动端安装逻辑一致）。
+>
 > **版本 0.0.10（多音源播放后端：QQ/酷狗原生取链）**
 > 根因：v0.0.9 仅网易云走 weapi，酷狗/QQ 歌曲仍靠「歌名 best-effort 匹配网易云」回退——但用户收藏集以 QQ 源为主，这些歌在网易云多已变灰（诊断抽样 0 错配、100% 真变灰），故实际可播率仍低。
 > 修复：为每种来源接入各自官方取链端点，歌曲不再被迫转网易云：
