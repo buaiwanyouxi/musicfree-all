@@ -25,8 +25,18 @@
 //                 /yy/special/index/1-<cid>-0.html  歌单卡片 (songlist 详情需登录)
 //
 // 作者: tianpeng (参考船长原版; 0.0.3 扩展多平台官方榜与热门歌单)
-const axios = require('axios');
-const cheerio = require('cheerio');
+(function () {
+  // 跨加载器兼容：优先用沙箱注入的 __musicfree_require（移动端），否则回退 require（桌面端）
+  // MusicFree 移动端仅注入 __musicfree_require，裸 require 会 ReferenceError 导致插件无法加载
+  var reqFn = (
+    typeof __musicfree_require !== 'undefined' ? __musicfree_require :
+    (typeof require !== 'undefined' ? require : null)
+  );
+  if (!reqFn) {
+    throw new Error('[buguyy] 插件沙箱未提供 require，无法加载');
+  }
+  var axios = reqFn('axios');
+  var cheerio = reqFn('cheerio');
 
 const BASE = 'https://www.buguyy.top';
 const UA =
@@ -732,9 +742,9 @@ function kugouRankSongs(html) {
 }
 
 // ===================== 插件入口 =====================
-module.exports = {
+var plugin = {
     platform: '布谷音乐',
-    version: '0.0.4',
+    version: '0.0.5',
     author: 'tianpeng',
     description:
         '布谷音乐 (buguyy.top) 插件，数据源为酷我音乐。支持歌曲搜索、播放、歌词，热歌/新歌/随机榜单与音乐串烧榜；'
@@ -1191,3 +1201,13 @@ module.exports = {
         throw new Error('不支持的歌单类型: ' + (sheetItem.src || '未知'));
     }
 };
+
+    // 跨加载器导出：新协议用 module.exports，旧协议（移动端）用返回值
+    if (typeof module !== 'undefined' && module && module.exports) {
+        module.exports = plugin;
+    }
+    if (typeof exports !== 'undefined') {
+        exports.default = plugin;
+    }
+    return plugin;
+})();
