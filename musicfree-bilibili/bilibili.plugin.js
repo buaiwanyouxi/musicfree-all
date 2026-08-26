@@ -548,8 +548,8 @@ module.exports = {
   version: '1.1.4',
   author: '船长',
   description: 'B站音频源：入站必刷/每周必刷/各分区排行榜/我的收藏夹，以音频模式播放（仅供个人学习）',
-  // 远程更新地址（Gitee raw 直链，MusicFree 据此检测插件更新）
-  srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js',
+  // 远程更新地址：raw.giteeusercontent.com 直链（gitee.com/raw 会 302，直链零跳转更稳）
+  srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js',
   cacheControl: 'no-store', // 音频 URL 有时效性，禁止缓存
   primaryKey: ['bvid', 'cid'],
   supportedSearchType: ['music'],
