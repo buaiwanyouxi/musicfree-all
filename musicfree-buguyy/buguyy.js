@@ -245,6 +245,37 @@ const QQ_CHARTS = [
     { group: 'QQ全球榜', topId: '105', title: '日本公信榜' }
 ];
 
+// QQ 榜详情解析 (getTopListDetail/getMusicSheetInfo 共用): 返回 { musicList, total, intro }
+// 页面改版后 songInfoList 可能位于 data 下或顶层, 兼容两种结构; 再兜底轻量列表 data.song
+async function qqChartDetail(topId) {
+    const html = await httpQQ('/n/ryqq_v2/toplist/' + topId);
+    const d = parseQQInitialData(html);
+    const info = (d && d.data) || d;
+    let songs = [];
+    if (info && Array.isArray(info.songInfoList)) songs = info.songInfoList;
+    else if (d && Array.isArray(d.songInfoList)) songs = d.songInfoList;
+    else if (info && Array.isArray(info.song)) songs = info.song;
+    if (!songs.length) throw new Error('QQ 榜单解析失败: 未取到歌曲');
+    const musicList = songs.map(sg => {
+        let cover = (sg.coverUrl || '').replace(/^http:/, 'https:');
+        if (cover.indexOf('//') === 0) cover = 'https:' + cover; // 协议相对 URL
+        return {
+            id: String(sg.mid || sg.id),
+            title: sg.title || sg.name || '',
+            artist: (sg.singer || []).map(x => x.name).join(' / '),
+            artwork: cover,
+            duration: sg.interval || undefined,
+            album: (sg.album && sg.album.name) || undefined,
+            src: 'qq'
+        };
+    });
+    return {
+        musicList: musicList,
+        total: (info && info.totalNum) || songs.length,
+        intro: (info && (info.intro || info.updateTips)) || ''
+    };
+}
+
 async function httpQQ(path) {
     const res = await axios.get('https://y.qq.com' + path, {
         headers: {
@@ -316,6 +347,112 @@ async function kuwoApiGet(path, params) {
         throw new Error('酷我接口返回失败: ' + (data && data.msg ? data.msg : JSON.stringify(data).slice(0, 80)));
     }
     return data;
+}
+// 酷我遗留搜索 (观察自 kuwo.cn 搜索页: 关键词参数为 all; 仅需 UA+Referer, 无需 Cookie/Secret)
+// 返回 [{rid, name, artist, album}]
+async function kuwoSearch(kw, pn, rn) {
+    const res = await axios.get(KUWO_BASE + '/search/searchMusicBykeyWord', {
+        params: {
+            all: kw, vipver: 1, client: 'kt', ft: 'music', cluster: 0, strategy: 2012,
+            encoding: 'utf8', rformat: 'json', mobi: 1, issubtitle: 1, show_copyright_off: 1,
+            pn: pn || 0, rn: rn || 20
+        },
+        headers: { 'User-Agent': UA163, Referer: 'https://www.kuwo.cn/search/list' },
+        timeout: 10000
+    });
+    const d = res.data || {};
+    const list = Array.isArray(d.abslist) ? d.abslist : [];
+    const out = [];
+    for (const s of list) {
+        const rid = String(s.MUSICRID || '').replace(/^MUSIC_/, '');
+        if (!rid) continue;
+        out.push({ rid: rid, name: s.NAME || '', artist: s.ARTIST || '', album: s.ALBUM || '' });
+    }
+    return out;
+}
+// 酷我网页直连播放 (观察自前端 bundle getPlayUrl: /api/v1/www/music/playUrl, 参数名 mid 实传 rid)
+// 免费歌曲返回 {code:200,data:{url}}; 付费歌曲返回 {code:-1,msg:该歌曲为付费内容...}
+async function kuwoPlayUrl(rid) {
+    const data = await kuwoApiGet('/api/v1/www/music/playUrl', { mid: rid, type: 'music' });
+    const url = data.data && data.data.url;
+    if (!url) throw new Error('酷我直连未返回播放地址');
+    return url;
+}
+// 标题归一化: 全角括号→半角, 去空白 (命中 "金达莱花 (猛）" vs 请求 "金达莱花(猛Remix)" 的差异)
+function normalizeKuwoTitle(s) {
+    return (s || '').replace(/（/g, '(').replace(/）/g, ')').replace(/\s+/g, '');
+}
+// 酷我搜索结果打分: 标题相等+4 / 包含+2 / 去括号后缀后核心标题相等+4, 歌手包含+3; 总分<4 拒绝, 防错配
+function pickKuwoHit(hits, musicItem) {
+    const k = normalizeKuwoTitle(musicItem.title);
+    if (!k) return null;
+    const kCore = k.replace(/\([^)]*\)/g, '');
+    const artist = ((musicItem.artist || '').split(/[\/，,、&\s]+/)[0] || '').trim();
+    let best = null;
+    let bestScore = -1;
+    for (const it of hits) {
+        const t = normalizeKuwoTitle(it.name);
+        if (!t) continue;
+        let s = 0;
+        if (t === k) s += 4;
+        else if (t.indexOf(k) !== -1 || k.indexOf(t) !== -1) s += 2;
+        else {
+            const tCore = t.replace(/\([^)]*\)/g, '');
+            if (kCore && tCore === kCore) s += 4;
+        }
+        if (artist && (it.artist || '').indexOf(artist) !== -1) s += 3;
+        if (s > bestScore) {
+            bestScore = s;
+            best = it;
+        }
+    }
+    if (!best || bestScore < 4) return null;
+    return best;
+}
+
+// 在搜索结果中挑一个 可替代 命中的条目 (跳过已确认付费的 excludeRid, 按相关度顺序)
+function pickKuwoAlt(hits, musicItem, excludeRid) {
+    const ex = String(excludeRid || '');
+    for (const it of hits) {
+        if (ex && it.rid === ex) continue;
+        const solo = pickKuwoHit([it], musicItem);
+        if (solo) return solo;
+    }
+    return null;
+}
+// 酷我直连解析: 按候选顺序尝试 playUrl, 任一免费版本命中即返回
+// 候选顺序: (kuwo源) 原始rid 优先; 搜索按 标题+歌手 → 纯标题, 跳过打分<4 与重复 rid;
+// 头部命中常为 VIP 版本 (playUrl code:-1), 逐候选重试直到拿到免费 URL。
+async function resolveKuwoDirect(musicItem) {
+    const firstArtist = ((musicItem.artist || '').split(/[\/，,、&\s]+/)[0] || '').trim();
+    const candidates = [];
+    const tried = {};
+    function pushHits(hits) {
+        for (const it of hits) {
+            if (!it.rid || tried[it.rid]) continue;
+            const solo = pickKuwoHit([it], musicItem);
+            if (solo) { tried[it.rid] = 1; candidates.push(solo); }
+        }
+    }
+    if (musicItem.src === 'kuwo' && musicItem.id) {
+        candidates.push({ rid: String(musicItem.id) });
+        tried[String(musicItem.id)] = 1;
+    }
+    const kw1 = (musicItem.title || '').trim();
+    const kw2 = (kw1 + ' ' + firstArtist).replace(/\s+/g, ' ').trim();
+    try {
+        if (firstArtist && kw2 !== kw1) {
+            pushHits(await kuwoSearch(kw2, 0, 10));
+        }
+        pushHits(await kuwoSearch(kw1, 0, 10));
+    } catch (e) { /* 搜索异常: 仍尝试已收集候选 */ }
+    for (const c of candidates) {
+        try {
+            const u = await kuwoPlayUrl(c.rid);
+            if (u) return u;
+        } catch (e) { /* 付费/不可用, 试下一个候选 */ }
+    }
+    return null;
 }
 
 // ===================== NUXT 载荷解析器 (不依赖 eval) =====================
@@ -569,15 +706,40 @@ async function httpKugou(path) {
     });
     return res.data;
 }
+// 酷狗榜单页 SSR 解析: /yy/rank/home/<page>-<rankid>.html 内嵌 22 首/页
+function kugouRankSongs(html) {
+    const $ = cheerio.load(html);
+    const musicList = [];
+    $('#rankWrap li[data-eid]').each((idx, el) => {
+        const e = $(el);
+        const title = e.attr('title') || '';
+        const dash = title.indexOf(' - ');
+        const artist = dash !== -1 ? title.slice(0, dash).trim() : '';
+        const name = dash !== -1 ? title.slice(dash + 3).trim() : title.trim();
+        const eid = e.attr('data-eid');
+        if (!eid || !name) return;
+        const dur = e.find('.pc_temp_time').first().text().trim();
+        const dm = dur.match(/(\d+):(\d+)/);
+        musicList.push({
+            id: eid,
+            title: name,
+            artist: artist,
+            duration: dm ? Number(dm[1]) * 60 + Number(dm[2]) : undefined,
+            src: 'kugou'
+        });
+    });
+    return musicList;
+}
 
 // ===================== 插件入口 =====================
 module.exports = {
     platform: '布谷音乐',
-    version: '0.0.3',
+    version: '0.0.4',
     author: 'tianpeng',
     description:
         '布谷音乐 (buguyy.top) 插件，数据源为酷我音乐。支持歌曲搜索、播放、歌词，热歌/新歌/随机榜单与音乐串烧榜；'
-        + '内置网易云/QQ/酷我/酷狗官方排行榜与热门歌单 (非原生歌曲跨源搜索兜底播放, 汽水音乐无公开 Web 数据源未接入)。',
+        + '内置网易云/QQ/酷我/酷狗官方排行榜 (QQ/酷狗热门歌单以官方榜提供, 平台歌单内容需登录态)；'
+        + '播放源链: 布谷镜像 → 酷我直连 (playUrl/搜索解析 rid), 跨源兜底补齐镜像未收录歌曲 (汽水音乐无公开 Web 数据源未接入)。',
     srcUrl: 'https://www.buguyy.top',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
@@ -595,29 +757,50 @@ module.exports = {
     },
 
     // ===== 获取播放链接 =====
-    // buguyy/酷我歌曲: 酷我 CDN 直链 (id 即酷我 rid); 网易云/QQ/酷狗歌曲: 跨源搜索兜底。
+    // 播放源链: 1) 布谷镜像 (原生 geturl / 跨源搜索 geturl) → 2) 酷我直连
+    // (酷我歌曲 playUrl(rid); 其他歌曲 酷我搜索定位 rid 后 playUrl) → 3) 失败 (付费/无收录)。
+    // 布谷镜像只覆盖部分曲库且 geturl 有限流, 酷我直连兜底保障榜单/歌单歌曲可播。
     async getMediaSource(musicItem, quality) {
         let kuwoId = musicItem.id;
         if (musicItem.src && musicItem.src !== 'buguyy' && musicItem.src !== 'kuwo') {
-            kuwoId = (await crossResolve(musicItem)).id;
+            try { kuwoId = (await crossResolve(musicItem)).id; } catch (e) { kuwoId = null; }
         }
-        let data;
-        try { data = await apiGet('/api/geturl', { id: kuwoId }); } catch (e) { data = null; }
-        // 酷我榜/歌单歌曲: rid 可能不在布谷镜像内 (新歌/区域歌曲) → 跨源搜索兜底
-        if ((!data || !data.url || data.url === 'None') && musicItem.src === 'kuwo') {
-            const m = await crossResolve(musicItem);
-            if (m && m.id !== kuwoId) data = await apiGet('/api/geturl', { id: m.id });
-        }
-        if (!data || !data.url || data.url === 'None') {
-            throw new Error('获取播放链接失败');
-        }
-        return {
-            url: data.url,
-            headers: {
-                'User-Agent': UA,
-                Referer: BASE + '/'
+        if (kuwoId) {
+            let data = null;
+            try { data = await apiGet('/api/geturl', { id: kuwoId }); } catch (e) { data = null; }
+            // 酷我榜/歌单歌曲: rid 可能不在布谷镜像内 (新歌/区域歌曲) → 跨源搜索兜底
+            if ((!data || !data.url || data.url === 'None') && musicItem.src === 'kuwo') {
+                try {
+                    const m = await crossResolve(musicItem);
+                    if (m && m.id !== kuwoId) data = await apiGet('/api/geturl', { id: m.id });
+                } catch (e) { /* 镜像未收录, 走酷我直连 */ }
             }
-        };
+            if (data && data.url && data.url !== 'None') {
+                return {
+                    url: data.url,
+                    headers: {
+                        'User-Agent': UA,
+                        Referer: BASE + '/'
+                    }
+                };
+            }
+        }
+        // 酷我直连兜底: 原始rid/搜索候选 逐个 playUrl (头部命中常为VIP版, 自动换下一候选)
+        let kuwoUrl = null;
+        try {
+            kuwoUrl = await resolveKuwoDirect(musicItem);
+        } catch (e) { /* 酷我服务异常 */ }
+
+        if (kuwoUrl) {
+            return {
+                url: kuwoUrl,
+                headers: {
+                    'User-Agent': UA163,
+                    Referer: 'https://www.kuwo.cn/'
+                }
+            };
+        }
+        throw new Error('未找到可播放音源 (可能为付费内容或未收录): ' + (musicItem.title || ''));
     },
 
     // ===== 歌词 =====
@@ -766,33 +949,11 @@ module.exports = {
         // --- QQ 官方榜: /n/ryqq_v2/toplist/<topId> SSR top20 ---
         if (topListItem.src === 'qq') {
             if (page > 1) return { isEnd: true, musicList: [] };
-            const html = await httpQQ('/n/ryqq_v2/toplist/' + topListItem.topId);
-            const d = parseQQInitialData(html);
-            const info = (d && d.data) || d;
-            // 页面改版后 songInfoList 从 data 下移到顶层, 兼容两种结构; 再兜底轻量列表 data.song
-            let songs = [];
-            if (info && Array.isArray(info.songInfoList)) songs = info.songInfoList;
-            else if (d && Array.isArray(d.songInfoList)) songs = d.songInfoList;
-            else if (info && Array.isArray(info.song)) songs = info.song;
-            if (!songs.length) throw new Error('QQ 榜单解析失败: 未取到歌曲');
-            const total = (info && info.totalNum) || songs.length;
-            const musicList = songs.map(sg => {
-                let cover = (sg.coverUrl || '').replace(/^http:/, 'https:');
-                if (cover.indexOf('//') === 0) cover = 'https:' + cover; // 协议相对 URL
-                return {
-                    id: String(sg.mid || sg.id),
-                    title: sg.title || sg.name || '',
-                    artist: (sg.singer || []).map(x => x.name).join(' / '),
-                    artwork: cover,
-                    duration: sg.interval || undefined,
-                    album: (sg.album && sg.album.name) || undefined,
-                    src: 'qq'
-                };
-            });
-            const result = { isEnd: true, musicList: musicList };
+            const d = await qqChartDetail(topListItem.topId || String(topListItem.id).replace(/^qq/, ''));
+            const result = { isEnd: true, musicList: d.musicList };
             result.topListItem = Object.assign({}, topListItem, {
-                worksNum: total,
-                description: (info && (info.intro || info.updateTips)) || undefined
+                worksNum: d.total,
+                description: d.intro || undefined
             });
             return result;
         }
@@ -825,29 +986,11 @@ module.exports = {
         // --- 酷狗官方榜: /yy/rank/home/<page>-<rankid>.html SSR 22首/页 ---
         if (topListItem.src === 'kugou') {
             const html = await httpKugou('/yy/rank/home/' + page + '-' + topListItem.rankId + '.html');
-            const $ = cheerio.load(html);
-            const musicList = [];
-            $('#rankWrap li[data-eid]').each((idx, el) => {
-                const e = $(el);
-                const title = e.attr('title') || '';
-                const dash = title.indexOf(' - ');
-                const artist = dash !== -1 ? title.slice(0, dash).trim() : '';
-                const name = dash !== -1 ? title.slice(dash + 3).trim() : title.trim();
-                const eid = e.attr('data-eid');
-                if (!eid || !name) return;
-                const dur = e.find('.pc_temp_time').first().text().trim();
-                const dm = dur.match(/(\d+):(\d+)/);
-                musicList.push({
-                    id: eid,
-                    title: name,
-                    artist: artist,
-                    duration: dm ? Number(dm[1]) * 60 + Number(dm[2]) : undefined,
-                    src: 'kugou'
-                });
-            });
+            const musicList = kugouRankSongs(html);
             if (!musicList.length) return { isEnd: true, musicList: [] };
             const result = { isEnd: musicList.length < 22, musicList: musicList };
             if (page === 1) {
+                const $ = cheerio.load(html);
                 const h3 = $('#pc_temp_title h3').first().text().trim();
                 const up = $('.rank_update').first().text().trim();
                 result.topListItem = Object.assign({}, topListItem, {
@@ -928,21 +1071,18 @@ module.exports = {
             return { isEnd: true, data: sheets };
         }
         if (tag.id === 'qq') {
-            if (page > 1) return { isEnd: true, data: [] };
-            const html = await httpQQ('/n/ryqq_v2/category');
-            const d = parseQQInitialData(html);
-            const list = (d && Array.isArray(d.playlist)) ? d.playlist : [];
-            if (!list.length) throw new Error('QQ 热门歌单解析失败');
+            // QQ 歌单歌曲列表需登录态 (ag-1 加密通道), 热门歌单以 QQ 官方榜提供 (10个/页)
+            const start = (page - 1) * 10;
+            const slice = QQ_CHARTS.slice(start, start + 10);
             return {
-                isEnd: true,
-                data: list.map(p => ({
-                    id: 'qqpl' + p.dissid,
-                    title: p.dissname || '',
-                    artwork: (p.imgurl || '').replace(/^http:/, 'https:'),
-                    artist: p.creatorname || undefined,
-                    playCount: Number(p.listennum) || undefined,
+                isEnd: start + 10 >= QQ_CHARTS.length,
+                data: slice.map(c => ({
+                    id: 'qq' + c.topId,
+                    title: c.title,
+                    artwork: '',
                     src: 'qq',
-                    note: '该歌单详情需登录, 暂无法获取歌曲列表'
+                    topId: c.topId,
+                    description: c.group
                 }))
             };
         }
@@ -966,30 +1106,20 @@ module.exports = {
             };
         }
         if (tag.id === 'kugou') {
-            if (page > 1) return { isEnd: true, data: [] };
-            // cid=6 最热 (推荐5/最热6/最新7/热藏3/飙升8)
-            const html = await httpKugou('/yy/special/index/1-6-0.html');
-            const $ = cheerio.load(html);
-            const sheets = [];
-            $('#ulAlbums > li').each((i, el) => {
-                const e = $(el);
-                const a = e.find('a[href*="/songlist/"]').first();
-                const href = a.attr('href') || '';
-                const m = href.match(/gcid_([a-z0-9]+)/);
-                if (!m) return;
-                const img = e.find('img').attr('_src') || e.find('img').attr('src') || '';
-                const maker = e.find('em').first().text().replace(/^制作人[：:]\s*/, '').trim();
-                sheets.push({
-                    id: 'kgpl' + m[1],
-                    title: (a.attr('title') || a.text() || '').trim(),
-                    artwork: img.replace(/^http:/, 'https:'),
-                    artist: maker || undefined,
+            // 酷狗歌单详情需登录态 (统一登录墙), 热门歌单以酷狗官方榜提供 (10个/页)
+            const start = (page - 1) * 10;
+            const slice = KUGOU_CHARTS.slice(start, start + 10);
+            return {
+                isEnd: start + 10 >= KUGOU_CHARTS.length,
+                data: slice.map(c => ({
+                    id: 'kg' + c.rankId,
+                    title: c.title,
+                    artwork: '',
                     src: 'kugou',
-                    note: '该歌单详情需登录, 暂无法获取歌曲列表'
-                });
-            });
-            if (!sheets.length) throw new Error('酷狗热门歌单解析失败');
-            return { isEnd: true, data: sheets };
+                    rankId: c.rankId,
+                    description: c.group
+                }))
+            };
         }
         throw new Error('未知歌单标签: ' + tag.id);
     },
@@ -1037,9 +1167,24 @@ module.exports = {
             });
             return result;
         }
-        if (sheetItem.src === 'qq' || sheetItem.src === 'kugou') {
-            // 歌单详情页为 SPA 且歌曲接口需登录 (QQ ag-1 加密 / 酷狗登录墙), 无法离线解析
-            const result = { isEnd: true, musicList: [] };
+        if (sheetItem.src === 'qq') {
+            // 热门歌单标签下的 QQ 条目为官方榜 (id=qq<topId>)
+            if (page > 1) return { isEnd: true, musicList: [] };
+            const topId = sheetItem.topId || String(sheetItem.id).replace(/^qq/, '');
+            const d = await qqChartDetail(topId);
+            const result = { isEnd: true, musicList: d.musicList };
+            result.sheetItem = Object.assign({}, sheetItem, {
+                worksNum: d.total,
+                description: d.intro || sheetItem.description
+            });
+            return result;
+        }
+        if (sheetItem.src === 'kugou') {
+            // 热门歌单标签下的酷狗条目为官方榜 (id=kg<rankId>, 22首/页)
+            const rankId = sheetItem.rankId || String(sheetItem.id).replace(/^kg/, '');
+            const html = await httpKugou('/yy/rank/home/' + page + '-' + rankId + '.html');
+            const musicList = kugouRankSongs(html);
+            const result = { isEnd: musicList.length < 22, musicList: musicList };
             result.sheetItem = Object.assign({}, sheetItem);
             return result;
         }
