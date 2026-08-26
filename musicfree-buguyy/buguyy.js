@@ -740,7 +740,7 @@ module.exports = {
         '布谷音乐 (buguyy.top) 插件，数据源为酷我音乐。支持歌曲搜索、播放、歌词，热歌/新歌/随机榜单与音乐串烧榜；'
         + '内置网易云/QQ/酷我/酷狗官方排行榜 (QQ/酷狗热门歌单以官方榜提供, 平台歌单内容需登录态)；'
         + '播放源链: 布谷镜像 → 酷我直连 (playUrl/搜索解析 rid), 跨源兜底补齐镜像未收录歌曲 (汽水音乐无公开 Web 数据源未接入)。',
-    srcUrl: 'https://www.buguyy.top',
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
 
