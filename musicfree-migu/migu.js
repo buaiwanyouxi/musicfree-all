@@ -125,7 +125,8 @@ module.exports = {
   platform: PLATFORM,
   version: '0.0.3',
   author: 'tianpeng',
-  srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-migu/migu.js',
+  // 安装/更新地址：raw.giteeusercontent.com 直链（gitee.com/raw 会 302，直链零跳转更稳）
+  srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-migu/migu.js',
 
   // 用户变量：填入咪咕登录 cookie 后，歌单（个人/推荐歌单）方可显示并可播放
   userVariables: [
