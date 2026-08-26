@@ -2,6 +2,18 @@
 
 将 [咪咕音乐](https://music.migu.cn/) 适配为 MusicFree 播放插件。支持搜索、播放、歌词、排行榜；**歌单需填入咪咕登录 Cookie 后显示**。
 
+- **平台标识**：`migu`（应用内显示为「咪咕音乐」）
+- **当前版本**：`v0.0.3`
+- **数据源**：`music.migu.cn` / `app.*.nf.migu.cn`（咪咕官方直链，需 Cookie 开启歌单）
+
+## 安装链接（从 URL 安装）
+
+```
+https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-migu/migu.js
+```
+
+MusicFree →「设置」→「插件设置」→「从网络安装插件」→ 粘贴上方链接。若需歌单，安装后点击插件「配置」填入 `miguCookie`。
+
 > 逆向方式：使用 Playwright 复用系统 Chrome 真实抓取站内请求，所有接口均来自浏览器实测，无猜测、无第三方 API。
 
 ## 接口逆向结论（均免 cookie，插件沙箱内可直接调用）
@@ -16,13 +28,19 @@
 
 请求头固定携带：`appid=h5`、`channel/subchannel=014X031`、`platform=H5`、`ua=Android_migu`、`version=6.8.8`、`referer=https://music.migu.cn/` 等。
 
-## 支持功能
+## 支持功能（已按源码逐项核对 v0.0.3）
 
-- ✅ 搜索（歌曲名 / 歌手），**支持翻页**
-- ✅ 播放（标准音质 PQ，免费档）
-- ✅ 歌词（LRC）
-- ✅ 排行榜（`getTopLists` / `getTopListDetail`，榜单列表 + 榜单内歌曲翻页）
-- 🔓 歌单（`getTopLists` / `getTopListDetail`，需填入咪咕登录 Cookie）
+| 能力 | 实现方法 | 状态 | 说明 |
+|------|----------|------|------|
+| 搜索 | `search` | ✅ | 按歌曲名 / 歌手，**支持翻页**（20 条/页） |
+| 播放 | `getMediaSource` | ✅ | 标准音质 PQ（免费档），返回 `freetyst.nf.migu.cn` 直链 |
+| 歌词 | `getLyric` | ✅ | 取音源接口下发的 `lrcUrl`，返回 LRC 文本 |
+| 排行榜 | `getTopLists` / `getTopListDetail` | ✅ | 免登录可用；榜单列表按分类展开，榜内歌曲可翻页 |
+| 歌单 | `getTopLists` / `getTopListDetail`（`_type: 'playlist'`） | 🔓 | 需填 `miguCookie`；与排行榜合并在同一入口返回 |
+| 导入歌单 / 单曲 | — | ❌ | 未实现 `importMusicSheet` / `importMusicItem`（咪咕无免登录歌单数据源） |
+| 专辑 / 歌手页 | — | ❌ | 未实现（bmw `album`/`singer` 接口匿名返回 `299997 请求不支持`） |
+
+> 插件内部对榜单与歌单用 `_type` 字段区分（`rank` / `playlist`），并通过 `_rankId` / `_playlistId` 路由到不同接口；歌曲项额外携带 `_contentId` / `_copyrightId` / `_resourceType` 用于取链，缺失者会被过滤掉。
 
 ## 关于「歌单 / 排行榜」
 
@@ -46,12 +64,19 @@
 
 ## 安装
 
-1. 将 `migu.js` 传到可访问的 raw 链接（GitHub 等），或本地「从文件安装」。
-2. MusicFree → 插件管理 → 从 URL 安装 → 填入：
-   ```
-   https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-migu/migu.js
-   ```
-3. 搜索「晴天」等关键词即可试听；「榜单」入口可浏览各排行榜并播放。
+**方式一：从网络安装（推荐）**
+
+MusicFree →「设置」→「插件设置」→「从网络安装插件」→ 填入：
+
+```
+https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-migu/migu.js
+```
+
+**方式二：从本地文件安装** —— 下载 `migu.js` 后选择「从本地文件安装插件」。
+
+安装完成后：搜索「晴天」等关键词即可试听；「榜单」入口可浏览各排行榜并播放；填入 `miguCookie` 后歌单一并出现。
+
+> 该直链已写入插件 `srcUrl`，后续可在 MusicFree 内直接「更新插件」。`https://gitee.com/koujiao/...` 形式也可用，但会 302 跳转。
 
 ## 文件
 
