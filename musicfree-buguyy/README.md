@@ -7,17 +7,13 @@
 - **版本**：0.0.5
 - **支持搜索类型**：music（歌曲）
 
-## 近期修复
-
-- **v0.0.5（移动端无法加载）**：原文件在顶部以 `const axios = require('axios')` / `const cheerio = require('cheerio')` 直接裸 `require`，并在末尾用裸 `module.exports = {...}` 导出。MusicFree **移动端沙箱仅注入 `__musicfree_require`，不注入裸 `require`**，裸 `require` 会立即抛 `ReferenceError` 导致插件零加载（PC 端 Electron 注入裸 `require` 故正常）。修复方式：整文件包 IIFE，依赖一律经跨加载器 `reqFn`（优先 `__musicfree_require`，回退 `require`）获取；导出同时兼容「新协议 `module.exports`」与「旧协议 `return` 表达式」（移动端走旧协议）。与同仓 gequbao / fangpi / xiage 的成熟写法一致。
-
 ## 已实现功能
 
 | 功能 | 方法 | 说明 |
 |------|------|------|
 | 搜索 | `search` | 布谷镜像 `/api/search`，按标题，单次最多 50 条（接口不翻页） |
 | 播放 | `getMediaSource` | 源链：布谷镜像 geturl → 酷我直连兜底（见下节） |
-| 歌词 | `getLyric` | 布谷镜像 LRC；跨源歌曲经搜索匹配 `about` 兜底 |
+| 歌词 | `getLyric` | 三级链：酷我 geturl.lrc → 布谷镜像 `about` → 歌词网 (followlyrics) 按歌名搜索兜底 |
 | 排行榜 | `getTopLists` / `getTopListDetail` | 布谷热歌/新歌/随机 + 音乐串烧 + **网易云 7 / QQ 30 / 酷我 6 / 酷狗 33 官方榜**（均支持翻页） |
 | 热门歌单 | `getRecommendSheetTags` / `getRecommendSheetsByTag` / `getMusicSheetInfo` | 网易云/酷我 推荐歌单（含详情）；QQ/酷狗 平台歌单需登录态，**以 30/33 个官方榜代替提供** |
 | 元数据 | `getMusicInfo` | 网易云单曲时长/歌手/专辑/封面补齐（SSR ld+json） |
@@ -31,6 +27,13 @@
    - 搜索命中常为 VIP 版本时（playUrl 返回付费提示），**自动尝试下一候选版本**直至取到可播免费链接；
 3. 全部失败（VIP 付费 / 酷我也未收录）→ 抛出「未找到可播放音源（可能为付费内容或未收录）」。
 
+### 歌词源链（getLyric）
+
+1. **酷我歌曲**：`/api/geturl?id=` 的 `lrc` → 落空则跨源搜索镜像条目的 `about` / `lrc`；
+2. **其他歌曲**（网易云/QQ/酷狗榜歌）：跨源搜索布谷镜像 → 命中条目的 `about` / `lrc`；
+3. **歌词网兜底**（前两级均落空，v0.0.5 新增）：`GET zh.followlyrics.com/search?name=<纯标题>` 按歌名搜索 → 打分选最佳命中（标题相等/包含/去括号核心相等 + 歌手加分，防错配）→ 取详情页 `div#lyrics` **按行提取** LRC（修复官方歌词插件删全部换行把 LRC 压成单行的问题）。
+   - 歌词网为 UGC 站，部分歌曲无歌词或仅有词曲信息，此时返回空歌词（不抛错）。
+
 ## 接口分析结论（基于浏览器实际观察）
 
 - 布谷站点为 Nuxt 3 SPA，API 基址 `/api/`；歌曲 `id` 为 base64 编码数字（即酷我 rid）。
@@ -40,14 +43,13 @@
 - **QQ 榜**：`/n/ryqq_v2/toplist/<topId>` SSR（20 首/页，INITIAL_DATA 需将 `:undefined` 替换为 `:null` 再 JSON.parse）。
 - **酷狗榜**：`/yy/rank/home/<page>-<rankId>.html` SSR（22 首/页，TOP500 可翻 23 页）。
 - **登录墙**：QQ/酷狗 平台自有歌单为 SPA 无匿名数据请求（`musicu.fcg` 匿名返回 `860100001`），故热门歌单以官方榜代替。
+- **歌词网 (followlyrics.com)**：SSR HTML，搜索 `?name=&type=song` 返回 15 条/页无翻页；详情页 `div#lyrics` 内 LRC 每行一个 `tr`（时间戳/文本分列 td），需逐行提取拼接，直接删换行会压扁整份 LRC。
 
 ## 安装方法
 
 ### 方式一：从 URL 安装（推荐，支持更新）
-1. 复制 raw 链接：`https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js`
+1. 复制 raw 链接：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js`
 2. 在 MusicFree 中「插件管理 → 从 URL 安装」，粘贴该链接即可。
-
-> 说明：统一使用 `raw.giteeusercontent.com` 零跳转直链，桌面端与移动端均可稳定加载（`gitee.com/.../raw/` 形式在部分移动端不跟随 302 跳转，可能安装失败）。
 
 ### 方式二：本地加载（开发调试）
 - 直接用支持的本地插件加载方式指向本目录的 `buguyy.js`。
@@ -67,7 +69,7 @@ node test-plugin.mjs
 3. **QQ/酷狗 平台自有歌单**（非官方榜）需登录态，匿名无法获取歌曲列表；
 4. **搜索不翻页**：接口单次最多约 50 条；
 5. **网易云普通歌单** SSR 仅取前 10 首（官方榜为全量 200 首）；
-6. **部分歌曲无歌词**：镜像无 LRC 时返回空歌词；
+6. **部分歌曲无歌词**：三级链（酷我/布谷镜像/歌词网）均取不到时返回空歌词（歌词网为 UGC 站，覆盖不全属站点侧限制）；
 7. **汽水音乐**无公开 Web 数据源，未接入。
 
 ## 版本历史
@@ -78,6 +80,7 @@ node test-plugin.mjs
 | 0.0.2 | 2026-08-25 | 新增随机推荐/音乐串烧榜（分页）、歌词 geturl 回退、排除不可用全网源 |
 | 0.0.3 | 2026-08-25 | 新增网易云 7 / QQ 30 / 酷我 / 酷狗 33 官方排行榜 + 四平台热门歌单；跨源播放兜底（布谷搜索→geturl）；酷我榜 Secret API；汽水音乐无公开数据源未接入 |
 | 0.0.4 | 2026-08-26 | 修复：QQ/酷狗热门歌单无内容（改用官方榜提供）；榜/歌单大部分歌曲无法播放（酷我直连 playUrl + 搜索定位 rid + 候选版本轮换规避 VIP 命中）；标题全角括号归一化提升匹配率 |
+| 0.0.5 | 2026-08-26 | 新增歌词网 (followlyrics.com) 作为歌词三级兜底：补齐镜像/酷我均无词的跨源歌歌词；按行提取修复官方歌词插件删换行压扁 LRC 的问题 |
 
 ## 文件说明
 
