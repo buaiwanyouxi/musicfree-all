@@ -1,6 +1,19 @@
 # 我要下歌 MusicFree 插件 (xiage)
 
-将「我要下歌」(https://xiage.yiwuku.com) 音乐站适配为 MusicFree 插件。
+- **平台标识**：`xiage`（应用内显示为「我要下歌」）
+- **当前版本**：`v0.0.14`
+- **数据源**：原站点 `xiage.yiwuku.com` **已变更为 铜钟 Tonzhon**（`tonzhon.com`）；适配 **wy 网易云 / kg 酷狗 / QQ 音乐** 三源
+- **不支持的源**：kw 酷我、百度（Tonzhon `types=playlist` 对二者返回 0 字节）；汽水/抖音（Tonzhon 无此源）
+
+## 安装链接（从 URL 安装）
+
+```
+https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js
+```
+
+---
+
+将「我要下歌」音乐站适配为 MusicFree 插件（原站点 `xiage.yiwuku.com` 已变更，后端现为 Tonzhon）。
 
 **音源后端：铜钟 Tonzhon（https://tonzhon.com）承担歌单/搜索/歌词；播放按歌曲来源路由至各自官方后端取可播直链。** 歌单(排行榜)/热门歌单、搜索、歌词、封面、导入均经 Tonzhon `api.php`；播放按来源路由：① 网易云 → weapi `song/enhance/player/url`（纯 JS AES-128-CBC 实现，零外部依赖，桌面/移动端通用）；② 腾讯QQ → `musicu.fcg` vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播；③ 酷狗 → `wwwapi.kugou.com` play/getdata。各后端失败均 best-effort 回退「按歌名匹配网易云 weapi」。
 
