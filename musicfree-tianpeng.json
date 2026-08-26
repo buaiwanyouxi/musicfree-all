@@ -1,0 +1,27 @@
+{
+  "name": "musicfree-tianpeng 插件订阅",
+  "author": "tianpeng / 船长",
+  "plugins": [
+    {
+      "name": "我要下歌",
+      "platform": "xiage",
+      "version": "0.0.14",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-xiage/xiage.js",
+      "id": 1
+    },
+    {
+      "name": "哔哩哔哩",
+      "platform": "bilibili",
+      "version": "1.1.4",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js",
+      "id": 2
+    },
+    {
+      "name": "布谷音乐",
+      "platform": "buguyy",
+      "version": "0.0.4",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js",
+      "id": 3
+    }
+  ]
+}
