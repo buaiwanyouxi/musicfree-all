@@ -4,8 +4,12 @@
 数据源为布谷镜像（酷我曲库子集）并直连酷我 Web 接口补齐曲库，音频为酷我 CDN 直链，无需登录、无需 Cookie。
 
 - **作者**：tianpeng
-- **版本**：0.0.4
+- **版本**：0.0.5
 - **支持搜索类型**：music（歌曲）
+
+## 近期修复
+
+- **v0.0.5（移动端无法加载）**：原文件在顶部以 `const axios = require('axios')` / `const cheerio = require('cheerio')` 直接裸 `require`，并在末尾用裸 `module.exports = {...}` 导出。MusicFree **移动端沙箱仅注入 `__musicfree_require`，不注入裸 `require`**，裸 `require` 会立即抛 `ReferenceError` 导致插件零加载（PC 端 Electron 注入裸 `require` 故正常）。修复方式：整文件包 IIFE，依赖一律经跨加载器 `reqFn`（优先 `__musicfree_require`，回退 `require`）获取；导出同时兼容「新协议 `module.exports`」与「旧协议 `return` 表达式」（移动端走旧协议）。与同仓 gequbao / fangpi / xiage 的成熟写法一致。
 
 ## 已实现功能
 
