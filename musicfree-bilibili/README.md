@@ -7,10 +7,12 @@
 ## 安装链接（从 URL 安装）
 
 ```
-https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js
+https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js
 ```
 
 MusicFree → 侧边栏「设置」→「插件设置」→「从网络安装插件」→ 粘贴上方链接 → 安装完成后点击插件「配置」填入 `SESSDATA`。
+
+> 也可用 `https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js`，该地址会 302 跳转到上方直链，实测同样可安装，但直链零跳转更稳。
 
 ## 核心特性
 
@@ -60,7 +62,7 @@ MusicFree → 侧边栏「设置」→「插件设置」→「从网络安装插
 **方式一：从网络安装（推荐）**
 
 1. MusicFree →「设置」→「插件设置」→「从网络安装插件」。
-2. 粘贴：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js`
+2. 粘贴：`https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js`
 3. 安装后在插件列表找到「Bilibili」→「配置」→ 填入 SESSDATA（见下一节）。
 4. 刷新插件，进入「榜单」即可看到「我的收藏夹」。
 
@@ -139,6 +141,6 @@ node test-plugin.js
 
 本插件发布于 Gitee：<https://gitee.com/koujiao/musicfree-tianpeng>（目录 `musicfree-bilibili/`）。
 
-- raw 直链：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js`
+- raw 直链：`https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js`
 - 该直链已写入插件 `srcUrl` 字段，用户在 MusicFree 内「更新插件」即可拉取新版本。
 - 维护者更新流程：修改 `bilibili.plugin.js` → 提升 `version` → 推送至上述仓库路径。
