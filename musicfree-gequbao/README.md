@@ -15,7 +15,7 @@
 | 搜索 | `search` | `GET /s/{关键词}`，单页返回全部结果（`?page=` 无效，恒 `isEnd=true`） |
 | 播放 | `getMediaSource` | 见下方「取链原理」，返回酷我 CDN 直链（`kw-er.kuwo.cn/.../*.mp3`，支持 Range） |
 | 歌词 | `getLyric` | 歌曲页内嵌 `<div id="content-lrc">`（`<br>` 分隔的 LRC），直接解析 |
-| 榜单 | `getTopLists` / `getTopListDetail` | 热歌榜 `hot-music`、每周搜索榜 `top/week-search`、每周下载榜 `top/week-download`、热词榜 `hot-words` |
+| 榜单/歌单 | `getTopLists` / `getTopListDetail` / `getMusicSheetInfo` | 热歌榜 `hot-music`、每周搜索榜 `top/week-search`、每周下载榜 `top/week-download`、热词榜 `hot-words`；歌单/榜单详情统一经 `fetchSheetItems` 拉取 |
 | 导入 | `importMusicItem` / `importMusicSheet` | 支持单曲链接与歌单/榜单链接导入 |
 
 ## 取链原理（已逆向验证）
@@ -37,9 +37,11 @@
 ### 方式一：从 URL 安装（推荐，支持更新）
 1. 复制以下 raw 链接：
    ```
-   https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-gequbao/gequbao.js
+   https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-gequbao/gequbao.js
    ```
 2. MusicFree → 插件管理 → 从 URL 安装 → 粘贴该链接即可。
+
+> 说明：统一使用 `raw.giteeusercontent.com` 零跳转直链，桌面端与移动端均可稳定加载（`gitee.com/.../raw/` 形式在部分移动端不跟随 302 跳转，可能安装失败）。
 
 ### 方式二：本地加载（开发调试）
 - 直接用支持的本地插件加载方式指向本目录的 `gequbao.js`。
