@@ -5,14 +5,99 @@
  * 技术约束（来自需求）：
  *   1) 不硬编码 Cookie，统一从 userVariables.SESSDATA 读取；
  *   2) 不使用 async 箭头函数（安卓 Hermes 引擎不支持），全部用 async function / 方法简写；
- *   3) 仅依赖沙箱内置 axios，不引入平台特定库；
+ *   3) 仅依赖沙箱内置 axios（通过跨加载器 reqFn 获取，兼容 PC / 移动端），md5 为纯 JS 实现，不引入平台特定库；
  *   4) 音频 URL 有时效性，cacheControl 设为 no-store，每次播放实时获取。
+ *
+ * 跨加载器兼容（v1.1.5 修复移动端无法加载）：
+ *   - 整文件用 IIFE 包裹，导出同时兼容「新协议 module.exports」与「旧协议 return 表达式」（移动端走旧协议）；
+ *   - 获取 axios / md5 一律通过沙箱注入的 __musicfree_require（回退 require），避免使用裸 require 在移动端抛 ReferenceError。
  *
  * 所有接口地址均来自对 B站页面的直接观察（需求文档已给出），未做任何网络搜索猜测。
  */
 
-const axios = require('axios');
-const crypto = require('crypto');
+(function () {
+  // 跨加载器兼容：优先用沙箱注入的 __musicfree_require，否则回退 require
+  // （MusicFree 移动端仅注入 __musicfree_require，裸 require 会 ReferenceError 导致插件无法加载）
+  var reqFn = (
+    typeof __musicfree_require !== 'undefined' ? __musicfree_require :
+    (typeof require !== 'undefined' ? require : null)
+  );
+  if (!reqFn) {
+    throw new Error('[bilibili] 插件沙箱未提供 require，无法加载');
+  }
+  var axios = reqFn('axios');
+
+  // 纯 JS 实现 md5（不依赖任何模块，PC / 移动端通用），供 WBI 签名使用
+  function md5hex(s) {
+    function rotateLeft(n, s) { return (n << s) | (n >>> (32 - s)); }
+    function toUtf8(str) {
+      var out = '';
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 0x80) out += String.fromCharCode(c);
+        else if (c < 0x800) out += String.fromCharCode(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+        else if (c >= 0xd800 && c < 0xdc00) {
+          var c2 = str.charCodeAt(i + 1); i++;
+          var u = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+          out += String.fromCharCode(0xf0 | (u >> 18), 0x80 | ((u >> 12) & 0x3f), 0x80 | ((u >> 6) & 0x3f), 0x80 | (u & 0x3f));
+        } else out += String.fromCharCode(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+      }
+      return out;
+    }
+    function add32(a, b) { return (a + b) & 0xffffffff; }
+    function cmn(q, a, b, x, s, t) {
+      a = add32(add32(a, q), add32(x, t));
+      return add32(rotateLeft(a, s), b);
+    }
+    function ff(a, b, c, d, x, s, t) { return cmn((b & c) | (~b & d), a, b, x, s, t); }
+    function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & ~d), a, b, x, s, t); }
+    function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+    function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | ~d), a, b, x, s, t); }
+    var str = toUtf8(s);
+    var n = str.length;
+    var state = [1732584193, -271733879, -1732584194, 271733878];
+    var len = n * 8;
+    str = str + String.fromCharCode(0x80);
+    while (str.length % 64 !== 56) str += String.fromCharCode(0);
+    var lenLo = len >>> 0, lenHi = Math.floor(len / 0x100000000);
+    for (var b = 0; b < 4; b++) str += String.fromCharCode((lenLo >>> (8 * b)) & 0xff);
+    for (var b2 = 0; b2 < 4; b2++) str += String.fromCharCode((lenHi >>> (8 * b2)) & 0xff);
+    for (var i = 0; i < str.length; i += 64) {
+      var X = [];
+      for (var j = 0; j < 16; j++) {
+        var w = i + j * 4;
+        X[j] = (str.charCodeAt(w)) | (str.charCodeAt(w + 1) << 8) | (str.charCodeAt(w + 2) << 16) | (str.charCodeAt(w + 3) << 24);
+      }
+      var a = state[0], b = state[1], c = state[2], d = state[3];
+      a = ff(a, b, c, d, X[0], 7, -680876936); d = ff(d, a, b, c, X[1], 12, -389564586); c = ff(c, d, a, b, X[2], 17, 606105819); b = ff(b, c, d, a, X[3], 22, -1044525330);
+      a = ff(a, b, c, d, X[4], 7, -176418897); d = ff(d, a, b, c, X[5], 12, 1200080426); c = ff(c, d, a, b, X[6], 17, -1473231341); b = ff(b, c, d, a, X[7], 22, -45705983);
+      a = ff(a, b, c, d, X[8], 7, 1770035416); d = ff(d, a, b, c, X[9], 12, -1958414417); c = ff(c, d, a, b, X[10], 17, -42063); b = ff(b, c, d, a, X[11], 22, -1990404162);
+      a = ff(a, b, c, d, X[12], 7, 1804603682); d = ff(d, a, b, c, X[13], 12, -40341101); c = ff(c, d, a, b, X[14], 17, -1502002290); b = ff(b, c, d, a, X[15], 22, 1236535329);
+      a = gg(a, b, c, d, X[1], 5, -165796510); d = gg(d, a, b, c, X[6], 9, -1069501632); c = gg(c, d, a, b, X[11], 14, 643717713); b = gg(b, c, d, a, X[0], 20, -373897302);
+      a = gg(a, b, c, d, X[5], 5, -701558691); d = gg(d, a, b, c, X[10], 9, 38016083); c = gg(c, d, a, b, X[15], 14, -660478335); b = gg(b, c, d, a, X[4], 20, -405537848);
+      a = gg(a, b, c, d, X[9], 5, 568446438); d = gg(d, a, b, c, X[14], 9, -1019803690); c = gg(c, d, a, b, X[3], 14, -187363961); b = gg(b, c, d, a, X[8], 20, 1163531501);
+      a = gg(a, b, c, d, X[13], 5, -1444681467); d = gg(d, a, b, c, X[2], 9, -51403784); c = gg(c, d, a, b, X[7], 14, 1735328473); b = gg(b, c, d, a, X[12], 20, -1926607734);
+      a = hh(a, b, c, d, X[5], 4, -378558); d = hh(d, a, b, c, X[8], 11, -2022574463); c = hh(c, d, a, b, X[11], 16, 1839030562); b = hh(b, c, d, a, X[14], 23, -35309556);
+      a = hh(a, b, c, d, X[1], 4, -1530992060); d = hh(d, a, b, c, X[4], 11, 1272893353); c = hh(c, d, a, b, X[7], 16, -155497632); b = hh(b, c, d, a, X[10], 23, -1094730640);
+      a = hh(a, b, c, d, X[13], 4, 681279174); d = hh(d, a, b, c, X[0], 11, -358537222); c = hh(c, d, a, b, X[3], 16, -722521979); b = hh(b, c, d, a, X[6], 23, 76029189);
+      a = hh(a, b, c, d, X[9], 4, -640364487); d = hh(d, a, b, c, X[12], 11, -421815835); c = hh(c, d, a, b, X[15], 16, 530742520); b = hh(b, c, d, a, X[2], 23, -995338651);
+      a = ii(a, b, c, d, X[0], 6, -198630844); d = ii(d, a, b, c, X[7], 10, 1126891415); c = ii(c, d, a, b, X[14], 15, -1416354905); b = ii(b, c, d, a, X[5], 21, -57434055);
+      a = ii(a, b, c, d, X[12], 6, 1700485571); d = ii(d, a, b, c, X[3], 10, -1894986606); c = ii(c, d, a, b, X[10], 15, -1051523); b = ii(b, c, d, a, X[1], 21, -2054922799);
+      a = ii(a, b, c, d, X[8], 6, 1873313359); d = ii(d, a, b, c, X[15], 10, -30611744); c = ii(c, d, a, b, X[6], 15, -1560198380); b = ii(b, c, d, a, X[13], 21, 1309151649);
+      a = ii(a, b, c, d, X[4], 6, -145523070); d = ii(d, a, b, c, X[11], 10, -1120210379); c = ii(c, d, a, b, X[2], 15, 718787259); b = ii(b, c, d, a, X[9], 21, -343485551);
+      state[0] = add32(state[0], a); state[1] = add32(state[1], b); state[2] = add32(state[2], c); state[3] = add32(state[3], d);
+    }
+    function hex(n) {
+      var s = '';
+      for (var k = 0; k < 4; k++) {
+        var v = (n >>> (8 * k)) & 0xff;
+        var h = v.toString(16);
+        s += (h.length === 1 ? '0' + h : h);
+      }
+      return s;
+    }
+    return hex(state[0]) + hex(state[1]) + hex(state[2]) + hex(state[3]);
+  }
 
 const API_HOST = 'https://api.bilibili.com';
 // 桌面/安卓统一伪装为桌面 Chrome，规避部分接口的 UA 风控
@@ -176,7 +261,7 @@ function _getMixinKey(orig) {
 }
 
 function _md5(s) {
-  return crypto.createHash('md5').update(s).digest('hex');
+  return md5hex(s);
 }
 
 let _wbiMixinKeyCache = '';
@@ -543,9 +628,9 @@ async function getPublicTopListDetail(topListItem, page) {
 
 /* ===================== 插件导出对象 ===================== */
 
-module.exports = {
+var plugin = {
   platform: 'Bilibili',
-  version: '1.1.4',
+  version: '1.1.5',
   author: '船长',
   description: 'B站音频源：入站必刷/每周必刷/各分区排行榜/我的收藏夹，以音频模式播放（仅供个人学习）',
   // 远程更新地址：raw.giteeusercontent.com 直链（gitee.com/raw 会 302，直链零跳转更稳）
@@ -869,4 +954,14 @@ module.exports = {
     );
     return [].concat.apply([], expanded);
   },
-};
+}
+
+  // 跨加载器导出：新协议用 module.exports，旧协议（移动端）用返回值
+  if (typeof module !== 'undefined' && module && module.exports) {
+    module.exports = plugin;
+  }
+  if (typeof exports !== 'undefined') {
+    exports.default = plugin;
+  }
+  return plugin;
+})();
