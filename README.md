@@ -1,5 +1,15 @@
 # MusicFree 音乐插件集合（作者：tianpeng）
 
+> ## 🔝 一键订阅（推荐）
+>
+> 在 MusicFree 中「设置 → 插件设置 → 插件订阅 → 添加订阅源」，粘贴下方订阅直链即可**一次性订阅全部已收录插件**（当前含 我要下歌 / 哔哩哔哩 / 布谷音乐）：
+>
+> ```
+> https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-tianpeng.json
+> ```
+>
+> 该链接为 `raw.giteeusercontent.com` 零跳转直链，桌面端与移动端均可稳定加载；订阅源文件详见 [musicfree-tianpeng.json](musicfree-tianpeng.json)。
+
 本仓库收录 6 个适配 [MusicFree](https://github.com/maotoumao/MusicFree) 的音源插件，数据源分别为「我要下歌」「咪咕音乐」「布谷音乐」「歌曲宝」「放屁音乐网」「哔哩哔哩」。
 
 ## 插件列表
