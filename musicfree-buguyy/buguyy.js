@@ -6,6 +6,7 @@
 //   排行榜: 网易云 / QQ / 酷我 / 酷狗 官方榜 (汽水音乐无公开 Web 数据源, 未接入)
 //   热门歌单: 网易云 (全量可播) / QQ (卡片, 详情需登录) / 酷我 (前20首) / 酷狗 (卡片, 详情需登录)
 //   非原生歌曲播放/歌词: 跨源搜索兜底 (按歌名+歌手搜同名酷我歌曲, 用户确认方案)
+//   歌词三级兜底 (0.0.5): 歌词网 followlyrics.com — 酷我 lrc 与布谷镜像均落空时按歌名搜 LRC (修复官方插件删换行压扁 bug)
 //
 // 已观察并验证的接口:
 //   [buguyy.top]  GET /api/search?keyword=  搜索 最多50条无翻页 {success,data:[{id,title,singer,picurl,about}]}
@@ -25,18 +26,8 @@
 //                 /yy/special/index/1-<cid>-0.html  歌单卡片 (songlist 详情需登录)
 //
 // 作者: tianpeng (参考船长原版; 0.0.3 扩展多平台官方榜与热门歌单)
-(function () {
-  // 跨加载器兼容：优先用沙箱注入的 __musicfree_require（移动端），否则回退 require（桌面端）
-  // MusicFree 移动端仅注入 __musicfree_require，裸 require 会 ReferenceError 导致插件无法加载
-  var reqFn = (
-    typeof __musicfree_require !== 'undefined' ? __musicfree_require :
-    (typeof require !== 'undefined' ? require : null)
-  );
-  if (!reqFn) {
-    throw new Error('[buguyy] 插件沙箱未提供 require，无法加载');
-  }
-  var axios = reqFn('axios');
-  var cheerio = reqFn('cheerio');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 const BASE = 'https://www.buguyy.top';
 const UA =
@@ -465,6 +456,96 @@ async function resolveKuwoDirect(musicItem) {
     return null;
 }
 
+// ===================== 歌词网 (followlyrics.com) 歌词三级兜底 =====================
+// 酷我 geturl.lrc 与布谷镜像 about 均落空时, 按歌名 (纯标题, 同布谷搜索) 搜 followlyrics 并取详情页 LRC。
+// 站点为 SSR HTML: 搜索结果表格 table.table-striped>tbody>tr (标题/歌手/专辑/详情链接);
+// 详情页 div#lyrics 内 LRC 每行一个 tr (时间戳与歌词文本可能分列多 td) → 按行提取合并,
+// 避免官方插件“删全部换行”的做法把整份 LRC 压成单行 (不可用)。
+const FOLLOW_BASE = 'https://zh.followlyrics.com';
+const FOLLOW_NL = String.fromCharCode(10);
+async function followlyricsSearch(title) {
+    const res = await axios.get(FOLLOW_BASE + '/search', {
+        params: { name: title, type: 'song' },
+        headers: { 'User-Agent': UA, Accept: 'text/html, application/xhtml+xml' },
+        timeout: 10000
+    });
+    const $ = cheerio.load(res.data);
+    const out = [];
+    $('table.table-striped > tbody > tr').each(function () {
+        const tds = $(this).children();
+        if (tds.length < 4) return;
+        const t = $(tds.get(0)).text().trim();
+        const href = $(tds.get(3)).find('a').attr('href') || '';
+        if (!t || !href) return;
+        out.push({
+            title: t,
+            artist: $(tds.get(1)).text().trim(),
+            url: href.indexOf('http') === 0 ? href : FOLLOW_BASE + href
+        });
+    });
+    return out;
+}
+// 命中打分 (同 pickKuwoHit): 标题相等+4 / 包含+2 / 去括号核心标题相等+4, 歌手包含+3, 总分<4 拒绝, 防错配
+function pickFollowHit(hits, musicItem) {
+    const k = normalizeKuwoTitle(musicItem.title);
+    if (!k) return null;
+    const kCore = k.replace(/\([^)]*\)/g, '');
+    const artist = ((musicItem.artist || '').split(/[\/，,、&\s]+/)[0] || '').trim();
+    let best = null;
+    let bestScore = -1;
+    for (const it of hits) {
+        const t = normalizeKuwoTitle(it.title);
+        if (!t) continue;
+        let s = 0;
+        if (t === k) s += 4;
+        else if (t.indexOf(k) !== -1 || k.indexOf(t) !== -1) s += 2;
+        else {
+            const tCore = t.replace(/\([^)]*\)/g, '');
+            if (kCore && tCore === kCore) s += 4;
+        }
+        if (artist && it.artist && it.artist.indexOf(artist) !== -1) s += 3;
+        if (s > bestScore) { bestScore = s; best = it; }
+    }
+    if (!best || bestScore < 4) return null;
+    return best;
+}
+// 取详情页 LRC: div#lyrics 按行提取 (纯时间戳行与下一文本行合并), 需含 [时间戳] 才算有效
+async function followlyricsLrc(url) {
+    const res = await axios.get(url, {
+        headers: { 'User-Agent': UA, Accept: 'text/html, application/xhtml+xml' },
+        timeout: 10000
+    });
+    const $ = cheerio.load(res.data);
+    const $box = $('div#lyrics');
+    if (!$box.length) return '';
+    const raw = $box.text().split(FOLLOW_NL).map(x => x.trim()).filter(Boolean);
+    const lines = [];
+    for (let i = 0; i < raw.length; i++) {
+        if (/^\[\d{1,2}:\d{2}(\.\d+)?\]$/.test(raw[i]) && i + 1 < raw.length && raw[i + 1].charAt(0) !== '[') {
+            lines.push(raw[i] + raw[i + 1]);
+            i++;
+        } else {
+            lines.push(raw[i]);
+        }
+    }
+    const lrc = lines.join(FOLLOW_NL).trim();
+    if (!lrc || !/\[\d{1,2}:\d{2}/.test(lrc)) return '';
+    return lrc;
+}
+// getLyric 三级兜底入口: 任何异常/空返回 '' (歌词兜底不抛错)
+async function followlyricsResolve(musicItem) {
+    const kw = (musicItem.title || '').trim();
+    if (!kw) return '';
+    try {
+        const hits = await followlyricsSearch(kw);
+        const hit = pickFollowHit(hits, musicItem);
+        if (!hit) return '';
+        return await followlyricsLrc(hit.url);
+    } catch (e) {
+        return '';
+    }
+}
+
 // ===================== NUXT 载荷解析器 (不依赖 eval) =====================
 // Nuxt SSR 形式: window.__NUXT__=(function(a,b,c){return{...}}(arg0,arg1,...))
 // 对象 key 内联, 字符串/数字值被抽成参数 → 确定性括号提取 + 字符串感知扫描求值
@@ -742,15 +823,16 @@ function kugouRankSongs(html) {
 }
 
 // ===================== 插件入口 =====================
-var plugin = {
+module.exports = {
     platform: '布谷音乐',
     version: '0.0.5',
     author: 'tianpeng',
     description:
         '布谷音乐 (buguyy.top) 插件，数据源为酷我音乐。支持歌曲搜索、播放、歌词，热歌/新歌/随机榜单与音乐串烧榜；'
         + '内置网易云/QQ/酷我/酷狗官方排行榜 (QQ/酷狗热门歌单以官方榜提供, 平台歌单内容需登录态)；'
-        + '播放源链: 布谷镜像 → 酷我直连 (playUrl/搜索解析 rid), 跨源兜底补齐镜像未收录歌曲 (汽水音乐无公开 Web 数据源未接入)。',
-    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js',
+        + '播放源链: 布谷镜像 → 酷我直连 (playUrl/搜索解析 rid), 跨源兜底补齐镜像未收录歌曲 (汽水音乐无公开 Web 数据源未接入)。'
+        + '歌词链: 酷我 lrc → 布谷镜像 → 歌词网 (followlyrics) 按歌名搜索兜底, 补齐跨源歌歌词。',
+    srcUrl: 'https://www.buguyy.top',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
 
@@ -831,6 +913,8 @@ var plugin = {
                 }
                 if (l) return { rawLrc: l };
             } catch (e) { /* 忽略 */ }
+            const l3 = await followlyricsResolve(musicItem);
+            if (l3) return { rawLrc: l3 };
             return { rawLrc: '' };
         }
         if (musicItem.src && musicItem.src !== 'buguyy') {
@@ -846,12 +930,18 @@ var plugin = {
                 }
                 if (l) return { rawLrc: l };
             } catch (e) { /* 跨源未命中则返回空歌词 */ }
+            const l3 = await followlyricsResolve(musicItem);
+            if (l3) return { rawLrc: l3 };
             return { rawLrc: '' };
         }
         const fromItem = cleanLrc(musicItem.about);
         if (fromItem) return { rawLrc: fromItem };
         const data = await apiGet('/api/geturl', { id: musicItem.id });
-        return { rawLrc: cleanLrc(data.lrc) };
+        const l2 = cleanLrc(data.lrc);
+        if (l2) return { rawLrc: l2 };
+        const l3 = await followlyricsResolve(musicItem);
+        if (l3) return { rawLrc: l3 };
+        return { rawLrc: '' };
     },
 
     // ===== 单曲元数据补充 (可选) =====
@@ -1201,13 +1291,3 @@ var plugin = {
         throw new Error('不支持的歌单类型: ' + (sheetItem.src || '未知'));
     }
 };
-
-    // 跨加载器导出：新协议用 module.exports，旧协议（移动端）用返回值
-    if (typeof module !== 'undefined' && module && module.exports) {
-        module.exports = plugin;
-    }
-    if (typeof exports !== 'undefined') {
-        exports.default = plugin;
-    }
-    return plugin;
-})();
