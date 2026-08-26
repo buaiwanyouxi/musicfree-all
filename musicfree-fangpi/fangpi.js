@@ -273,7 +273,7 @@
     version: '1.0.0',
     appVersion: '0.6.0',
     defaultSearchType: 'music',
-    srcUrl: BASE,
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-fangpi/fangpi.js',
     getTopLists: getTopLists,
     getTopListDetail: function (sheetItem) {
       return fetchSheetItems(sheetItem.id);
