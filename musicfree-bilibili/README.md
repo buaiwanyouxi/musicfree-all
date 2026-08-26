@@ -29,6 +29,11 @@ MusicFree → 侧边栏「设置」→「插件设置」→「从网络安装插
 
 ### 近期修复
 
+- **v1.1.5（修复移动端无法加载）**：根因是插件顶部使用裸 `require('axios')` / `require('crypto')` 与 `module.exports = {...}` 导出。桌面端（Electron/Node）`require` 与 `module` 均存在可正常工作；但 MusicFree 移动端沙箱**不注入裸 `require` 全局**（仅注入 `__musicfree_require`），且旧版加载协议不注入 `module`，故顶部 `require(...)` 直接抛 `ReferenceError`、插件整体无法加载。修复方式（与仓库内 gequbao/fangpi/xiage 一致）：
+  1. 整文件用 IIFE 包裹，导出同时兼容「新协议 `module.exports`」与「旧协议 `return` 表达式」；
+  2. 获取 `axios` 改用跨加载器 `reqFn`（优先 `__musicfree_require`，回退 `require`）；
+  3. md5（WBI 签名用）改为**纯 JS 实现**，彻底去掉对 `crypto` 模块的依赖（已在 Node 下与官方 `crypto` 逐字节验证一致）。
+  > 修复后已在 PC 新协议 与 移动端旧协议 两种加载模式下均验证可正常加载（7/7 方法导出正常），WBI 签名 `w_rid` 与官方结果一致。
 - **v1.1.4（收藏夹加载失败 + 多P视频导入）**：
   1. **收藏夹加载失败根因修复**：`getFavoriteFolders` 旧实现强制对 `list-all` 做 WBI 签名（nav 取密钥 + md5 + 签名请求），并在仅粘贴 SESSDATA（无 `DedeUserID`）时回退调用 `getUserInfo`(myinfo) 取 mid。该路径在数据中心沙箱正常、却在真实手机端（Hermes 引擎 + 真实网络）易失败——myinfo 异常会致 mid 为空、`list-all` 不带 `up_mid` 直接返回 `-400`；WBI 签名本身也对设备端不友好。现**彻底去除 list-all 的 WBI 签名**（已实测签名/不签名均返回 16 项），并改用更可靠的 `nav` 直接取 `mid`，同时保留 `DedeUserID` 优先解析。收藏夹列表接口本就无需签名，与社区成熟实现一致。
   2. **多P视频导入为歌单（新增）**：`importMusicSheet` 现优先识别视频链接（含 `BV` 号），通过 `/x/web-interface/view` 拉取全部分P，**逐集展开为独立音轨**（标题含「P序号 + 分集名」），如 `BV1oLBXBiEW5`（100 个分P）导入后形成 100 首的歌单，每首可独立播放。
