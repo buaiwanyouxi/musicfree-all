@@ -40,8 +40,10 @@
 ## 安装方法
 
 ### 方式一：从 URL 安装（推荐，支持更新）
-1. 复制 raw 链接：`https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js`
+1. 复制 raw 链接：`https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js`
 2. 在 MusicFree 中「插件管理 → 从 URL 安装」，粘贴该链接即可。
+
+> 说明：统一使用 `raw.giteeusercontent.com` 零跳转直链，桌面端与移动端均可稳定加载（`gitee.com/.../raw/` 形式在部分移动端不跟随 302 跳转，可能安装失败）。
 
 ### 方式二：本地加载（开发调试）
 - 直接用支持的本地插件加载方式指向本目录的 `buguyy.js`。
