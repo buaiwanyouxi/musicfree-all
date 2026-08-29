@@ -442,7 +442,12 @@
     }
     var sip = (sub.sip || []).filter(function (s) { return s && s.indexOf('http://ws') !== 0; });
     var domain = sip[0] || (sub.sip && sub.sip[0]) || '';
-    return domain + purl;
+    // 关键修复（0.0.4）：QQ 官方 vkey 返回的 CDN 域名是 http:// 明文链（如 aqqmusic.tc.qq.com）。
+    // Android（API28+）默认禁止明文 HTTP 流量，播放器加载 http:// 链会抛 CleartextTrafficNotPermitted
+    // 异常并导致应用闪退——而歌单/排行榜里大量热门曲恰好能直接拿到官方明文链，故「播放歌单/排行榜闪退、
+    // 搜索不闪退」（搜索多为无官方链的曲，自动落到 https 的 mvmp3 兜底而存活）。QQ CDN 支持 HTTPS，
+    // 已实测 https 版可正常返回 audio/mpeg，故此处统一升级为 https，彻底消除移动端明文链闪退。
+    return forceHttps(domain + purl);
   }
   async function getMediaSource(musicItem, quality) {
     var mid = String(musicItem.id || musicItem.songmid || '');
@@ -617,7 +622,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.3',
+  version: '0.0.4',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
