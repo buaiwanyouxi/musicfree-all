@@ -11,9 +11,9 @@
     },
     {
       "name": "哔哩哔哩",
-      "platform": "bilibili",
-      "version": "1.1.5",
-      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.plugin.js",
+      "platform": "Bilibili",
+      "version": "V0.0.7",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.js",
       "id": 2
     },
     {
@@ -22,6 +22,41 @@
       "version": "0.0.5",
       "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-buguyy/buguyy.js",
       "id": 3
+    },
+    {
+      "name": "酷狗",
+      "platform": "酷狗",
+      "version": "0.0.9",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-kg/kg.js",
+      "id": 4
+    },
+    {
+      "name": "酷我",
+      "platform": "酷我",
+      "version": "0.0.1",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-kw/kw.js",
+      "id": 5
+    },
+    {
+      "name": "汽水音乐",
+      "platform": "汽水音乐",
+      "version": "0.0.1",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qs/qs.js",
+      "id": 6
+    },
+    {
+      "name": "网易云音乐",
+      "platform": "网易云音乐",
+      "version": "0.0.1",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-wy/wy.js",
+      "id": 7
+    },
+    {
+      "name": "QQ音乐",
+      "platform": "QQ音乐",
+      "version": "0.0.1",
+      "url": "https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qq/qq.js",
+      "id": 8
     }
   ]
 }
