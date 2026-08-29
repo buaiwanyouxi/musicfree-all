@@ -416,7 +416,7 @@
     author: 'tianpeng',
     description: '酷我音源：支持歌单导入、热门歌单、官方排行榜，附带搜索/歌词/专辑/歌手。' +
       '取链使用社区代理 music.nxinxz.com（酷我官方免费接口已失效）。',
-    srcUrl: '',
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-kw/kw.js',
     cacheControl: 'no-cache',
     hints: {
       importMusicSheet: [
