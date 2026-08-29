@@ -20,12 +20,9 @@
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
-  // 移动端沙箱可能未注入 cheerio：改为「顶层 try/catch 懒失败」而非直接 reqFn('cheerio')。
-  // 旧写法在模块加载期即抛错，导致整个插件在移动端加载失败、播放直接闪退（应用崩溃）。
-  // mvmp3 解析处已做空值保护（!cheerio || !cheerio.load → 返回空列表），取不到 cheerio 时
-  // 会安全转下一层兜底音源，不会中断插件加载。
-  var cheerio = null;
-  try { cheerio = reqFn('cheerio'); } catch (e) { cheerio = null; }
+  // 无名音乐网(mvmp3) 搜索结果解析采用「纯正则」实现，不依赖 cheerio —— 移动端沙箱不注入 cheerio，
+  // 若用 cheerio.load 解析则移动端兜底音源完全失效（解析返回空 → 取链失败 → 非免费曲在歌单/排行榜连续
+  // 播放时易触发崩溃）。纯正则解析在桌面端/移动端一致可用，故彻底移除 cheerio 依赖。
 
   // ---------- 端点 ----------
   var HOST = 'https://c.y.qq.com';
@@ -221,25 +218,22 @@
     _mvCookie = fresh; _mvCookieAt = now; _mvCookieUser = false; return _mvCookie;
   }
   function mvIsVerify(html) { return /安全人机验证|我不是人机|verifyForm/.test(html || ''); }
+  // 纯正则解析：每条结果形如 <a href="/mp3/<32hex>.html" ...><img ... alt="歌名/歌手 - 曲名">...
+  // 不依赖 cheerio，移动端沙箱缺 cheerio 时也能正常解析（这是移动端首选备用音源可用的关键）。
   function mvParseItems(html) {
-    if (!cheerio || !cheerio.load) return [];
-    var $ = cheerio.load(html);
+    if (!html || typeof html !== 'string') return [];
     var items = [], seen = {};
-    $('.play_list li').each(function (i, el) {
-      var a = $(el).find('a.url').first();
-      if (!a.length) return;
-      var href = a.attr('href') || '';
-      var m = href.match(/\/mp3\/([a-f0-9]{32})\.html/i);
-      if (!m) return;
-      var id = m[1];
-      if (seen[id]) return;
+    var re = /<a\s+href="\/mp3\/([a-f0-9]{32})\.html"[^>]*>[\s\S]*?alt="([^"]*)"/gi;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1], raw = m[2] || '';
+      if (seen[id]) continue;
       seen[id] = 1;
-      var ta = (a.text() || '').replace(/\s+/g, ' ').trim();
-      var artist = '', title = ta;
-      var idx = ta.indexOf(' - ');
-      if (idx > 0) { artist = ta.substring(0, idx).trim(); title = ta.substring(idx + 3).trim(); }
+      var title = raw, artist = '';
+      var idx = raw.indexOf(' - ');
+      if (idx > 0) { artist = raw.substring(0, idx).trim(); title = raw.substring(idx + 3).trim(); }
       items.push({ id: id, title: title, artist: artist });
-    });
+    }
     return items;
   }
   function norm(s) {
@@ -426,7 +420,7 @@
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
   async function qqOfficialGetUrl(mid) {
     var uin = getUinFromCookie();
-    var filename = 'M500' + mid + mid + '.mp3'; // 高码率；C400 + .m4a 为普通码率
+    var filename = 'M500' + mid + '.mp3'; // 高码率；C400 + .m4a 为普通码率（filename 仅拼接一次 mid）
     var data = {
       req_0: {
         module: 'vkey.GetVkeyServer',
@@ -623,7 +617,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.2',
+  version: '0.0.3',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
