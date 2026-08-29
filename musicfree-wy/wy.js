@@ -544,7 +544,7 @@
     description: '网易云音乐音源：支持歌单导入、热门歌单、官方排行榜，附带搜索/歌词/取链。' +
       '全部走免加密官方 /api 接口；VIP/付费曲目免费态仅返回约 30 秒试听片段（版权限制），' +
       '插件自动改用【无名音乐网 mvmp3（首选）】与【歌曲宝 gequbao（次选）】双层备用音源兜底，最大化可播率。',
-    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-wy/wy.js',
+    srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-wy/wy.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music', 'sheet'],
     userVariables: [
