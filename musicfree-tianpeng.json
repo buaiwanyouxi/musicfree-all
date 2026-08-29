@@ -2,42 +2,42 @@
   "plugins": [
     {
       "name": "我要下歌",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-xiage/xiage.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-xiage/xiage.js",
       "id": 1
     },
     {
       "name": "布谷音乐",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-buguyy/buguyy.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-buguyy/buguyy.js",
       "id": 2
     },
     {
       "name": "QQ音乐",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-qq/qq.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-qq/qq.js",
       "id": 3
     },
     {
       "name": "网易云音乐",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-wy/wy.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-wy/wy.js",
       "id": 4
     },
     {
       "name": "酷我",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-kw/kw.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-kw/kw.js",
       "id": 5
     },
     {
       "name": "酷狗",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-kg/kg.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-kg/kg.js",
       "id": 6
     },
     {
       "name": "汽水音乐",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-qs/qs.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-qs/qs.js",
       "id": 7
     },
     {
       "name": "哔哩哔哩",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-bilibili/bilibili.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@2fd3c647fe2c9b6f4fee6366e3eebd55ed35c3b8/musicfree-bilibili/bilibili.js",
       "id": 8
     }
   ]
