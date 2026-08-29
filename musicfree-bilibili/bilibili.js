@@ -1225,8 +1225,7 @@
     version: 'V0.0.7',
     author: 'tianpeng',
     cacheControl: 'no-store',
-    // 更新链接：暂留空，待正式发布仓库确定后再填
-    srcUrl: '',
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.js',
     description:
       '在 MusicFree 搜索/播放 B站视频音频。基于 martin65536/bilibili.js 扩展，并集成本地 musicfree-bilibili 插件增强：\n' +
       '• 移动端兼容（IIFE + 纯 JS md5，无需 crypto-js/dayjs/he 等原生依赖）\n' +
