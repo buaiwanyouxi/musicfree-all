@@ -698,7 +698,7 @@
       '支持酷狗歌单导入、官方排行榜（按热歌/地区/特色/全球/曲风分层）与热门榜单；' +
       '热门歌单广场（分类标签浏览酷狗歌单）。' +
       'v0.0.9 修复：歌单详情/导入取歌改用 mobilecdn special/song JSON 接口，解决点进歌单歌曲空白。',
-    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-kg/kg.js',
+    srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-kg/kg.js',
     cacheControl: 'no-store',
     supportedSearchType: ['music'],
     primaryKey: ['id', 'album_id', 'album_audio_id'],
