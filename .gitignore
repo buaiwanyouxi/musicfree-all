@@ -1,0 +1,5 @@
+# 依赖与锁文件不入库（仅本地测试用）
+node_modules/
+package-lock.json
+*.log
+.DS_Store

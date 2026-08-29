@@ -1,0 +1,62 @@
+{
+  "name": "musicfree-tianpeng 插件订阅",
+  "author": "tianpeng / 船长",
+  "plugins": [
+    {
+      "name": "我要下歌",
+      "platform": "xiage",
+      "version": "0.0.14",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-xiage/xiage.js",
+      "id": 1
+    },
+    {
+      "name": "布谷音乐",
+      "platform": "buguyy",
+      "version": "0.0.5",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-buguyy/buguyy.js",
+      "id": 2
+    },
+    {
+      "name": "QQ音乐",
+      "platform": "QQ音乐",
+      "version": "0.0.1",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qq/qq.js",
+      "id": 3
+    },
+    {
+      "name": "网易云音乐",
+      "platform": "网易云音乐",
+      "version": "0.0.1",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-wy/wy.js",
+      "id": 4
+    },
+    {
+      "name": "酷我",
+      "platform": "酷我",
+      "version": "0.0.1",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kw/kw.js",
+      "id": 5
+    },
+    {
+      "name": "酷狗",
+      "platform": "酷狗",
+      "version": "0.0.9",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kg/kg.js",
+      "id": 6
+    },
+    {
+      "name": "汽水音乐",
+      "platform": "汽水音乐",
+      "version": "0.0.1",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qs/qs.js",
+      "id": 7
+    },
+    {
+      "name": "哔哩哔哩",
+      "platform": "Bilibili",
+      "version": "V0.0.8",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-bilibili/bilibili.js",
+      "id": 8
+    }
+  ]
+}
