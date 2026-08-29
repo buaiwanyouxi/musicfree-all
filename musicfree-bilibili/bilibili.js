@@ -205,6 +205,10 @@
   const UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
     '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  // 获取 buvid 指纹时使用移动端 UA（与官方 maotoumao/bilibili 插件一致，移动端风控更友好、指纹更易通过）
+  const FINGER_UA =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 ' +
+    '(KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1';
 
   // 读取用户自定义 UA（可选）。填了用用户的，否则用默认 Chrome 120
   function getUserUA() {
@@ -317,7 +321,7 @@
     if (_buvidCache && now - _buvidTs < 24 * 3600 * 1000) return;
     try {
       const r = await axios.get(API_HOST + '/x/frontend/finger/spi', {
-        headers: { 'User-Agent': UA },
+        headers: { 'User-Agent': FINGER_UA },
       });
       const d = (r.data && r.data.data) || {};
       if (d.b_3) {
@@ -333,6 +337,14 @@
   async function getCookieString() {
     const userCookie = getRawCookie();
     if (userCookie) return userCookie;
+    await ensureBuvid();
+    return _buvidCache || '';
+  }
+  // 仅返回匿名 buvid Cookie（搜索 / 公开榜单使用）。
+  // 关键：绝不携带用户登录态 SESSDATA —— 若用户在插件设置里填了「过期 / 异常」的 SESSDATA，
+  // 一旦随搜索请求发出，B站 会直接拒绝搜索（返回风控 code）导致「移动端搜不到任何结果」。
+  // 官方 maotoumao/bilibili 插件搜索也仅用 buvid，故对齐之。
+  async function getBuvidCookie() {
     await ensureBuvid();
     return _buvidCache || '';
   }
@@ -675,7 +687,7 @@
     };
     try {
       const res = (await axios.get(API_HOST + '/x/web-interface/search/type', {
-        headers: Object.assign({}, searchHeaders, { cookie: await getCookieString() }),
+        headers: Object.assign({}, searchHeaders, { cookie: await getBuvidCookie() }),
         params,
       })).data;
       if (!res) throw new Error('搜索接口返回空（可能被风控）');
@@ -823,42 +835,31 @@
       // 移动端 ExoPlayer 无法播放 B站 DASH 分离音频流（.m4s 碎片化 MP4），
       // 故移动端首选 fnval=0 的 durl 合并流（.mp4 单文件，兼容性最强）；
       // 桌面端 Electron 播放器可正常播放 .m4s，保留 fnval=16 dash 以获得低/标准/高/超高音质选择。
-      const useMobile = isMobile();
-      const preferredFnval = useMobile ? 0 : 16;
-      const fallbackFnval = useMobile ? 16 : 0;
-      const buildParams = (fnval) => musicItem.bvid
-        ? { bvid: musicItem.bvid, cid: cid, fnval: fnval }
-        : { aid: musicItem.aid, cid: cid, fnval: fnval };
-      const paramsP = buildParams(preferredFnval);
-      const paramsF = buildParams(fallbackFnval);
+      // 统一请求 fnval=16（DASH 分离音频流）。经与官方 maotoumao/bilibili 插件核对：
+      // MusicFree 移动端(ExoPlayer)与桌面端均原生支持 DASH .m4s，无需在移动端降为 fnval=0 的 durl。
+      // 旧版「移动端优先 durl」分支实测在移动端取不到可播流（表现为取得到地址却放不出声），故统一走 DASH。
+      const params = musicItem.bvid
+        ? { bvid: musicItem.bvid, cid: cid, fnval: 16 }
+        : { aid: musicItem.aid, cid: cid, fnval: 16 };
+
+      // 成功判定：code=0 且 DASH 音频轨非空
+      const okDash = (r) => r && r.code === 0 && r.data && r.data.dash && r.data.dash.audio && r.data.dash.audio.length;
 
       let res = null, lastErr = null;
-      // ① 登录态 playurl（仅当已登录，挂 SESSDATA，不挂 buvid 以避免 412）
+      // ① 已登录（填了 SESSDATA/cookie）→ 带登录态 playurl：解锁限定视频 + 更稳直链；仅挂 SESSDATA，不挂 buvid（避免 412）
       if (cookie) {
         try {
           res = (await axios.get(API_HOST + '/x/player/playurl', {
             headers: Object.assign({}, baseHeaders, { Cookie: cookie }),
-            params: paramsP,
+            params: params,
           })).data;
         } catch (e) { lastErr = e; res = null; }
       }
-      // 判定成功：code=0 且 dash.audio 有内容 或 durl 有内容
-      const ok = (r) => r && r.code === 0 && r.data &&
-        ((r.data.dash && r.data.dash.audio && r.data.dash.audio.length) ||
-         (r.data.durl && r.data.durl.length));
-      // ② 匿名 playurl 兜底（同首选 fnval）
-      if (!ok(res)) {
+      // ② 匿名 playurl 兜底（未登录/登录态失败仍可播公开视频）
+      if (!okDash(res)) {
         try {
           res = (await axios.get(API_HOST + '/x/player/playurl', {
-            headers: baseHeaders, params: paramsP,
-          })).data;
-        } catch (e) { lastErr = e; }
-      }
-      // ③ 跨格式兜底（移动端→dash，桌面端→durl）
-      if (!ok(res)) {
-        try {
-          res = (await axios.get(API_HOST + '/x/player/playurl', {
-            headers: baseHeaders, params: paramsF,
+            headers: baseHeaders, params: params,
           })).data;
         } catch (e) { lastErr = e; }
       }
@@ -880,16 +881,24 @@
         }
         if (!url) url = (audios[len - 1] || {}).baseUrl;
       } else if (res.data.durl && res.data.durl.length > 0) {
+        // 极少数无 DASH 音频轨的视频：退回 legacy durl 单流
         url = res.data.durl[0].url;
       } else {
-        throw new Error('playurl未返回音频流 dash/durl 均为空');
+        throw new Error('playurl未返回音频流（该视频可能受限或需登录态）');
       }
       if (!url) throw new Error('解析出的播放URL为空');
+      // 提取 CDN 主机名写入 host 头（B站 upos/mcdn CDN 对 host 头敏感，缺失可能 403/空流）
+      let host = '';
+      try { const m = /^[a-z]+:\/\/([^/?#]+)/i.exec(url); host = m ? m[1] : ''; } catch (e) { host = ''; }
       return {
         url: url,
         headers: {
           'User-Agent': UA,
-          Referer: referer,
+          'Referer': referer,
+          'Accept': '*/*',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Host': host,
         },
       };
     } catch (error) {
@@ -1243,10 +1252,10 @@
   var plugin = {
     platform: 'Bilibili',
     appVersion: '>=0.0',
-    version: 'V0.0.8',
+    version: 'V0.0.9',
     author: 'tianpeng',
     cacheControl: 'no-store',
-    srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-bilibili/bilibili.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-bilibili/bilibili.js',
     description:
       '在 MusicFree 搜索/播放 B站视频音频。基于 martin65536/bilibili.js 扩展，并集成本地 musicfree-bilibili 插件增强：\n' +
       '• 移动端兼容（IIFE + 纯 JS md5，无需 crypto-js/dayjs/he 等原生依赖）\n' +
