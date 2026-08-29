@@ -20,7 +20,12 @@
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
-  var cheerio = reqFn('cheerio'); // mvmp3 搜索页解析（沙箱内置；若不可用，mvmp3 兜底会安全失败转下一层）
+  // 移动端沙箱可能未注入 cheerio：改为「顶层 try/catch 懒失败」而非直接 reqFn('cheerio')。
+  // 旧写法在模块加载期即抛错，导致整个插件在移动端加载失败、播放直接闪退（应用崩溃）。
+  // mvmp3 解析处已做空值保护（!cheerio || !cheerio.load → 返回空列表），取不到 cheerio 时
+  // 会安全转下一层兜底音源，不会中断插件加载。
+  var cheerio = null;
+  try { cheerio = reqFn('cheerio'); } catch (e) { cheerio = null; }
 
   // ---------- 端点 ----------
   var HOST = 'https://c.y.qq.com';
@@ -618,12 +623,12 @@
 
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.0.1',
-    author: 'tianpeng',
+  version: '0.0.2',
+  author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
       '播放取链三层兜底：①官方QQ(CgiGetVkey，需登录Cookie解锁) → ②首选备用 无名音乐网mvmp3(自动过人机验证) → ③次选备用 Tonzhon网易云匹配(tonzhon.com搜索+weapi取链，覆盖QQ的VIP/试听失效曲)。',
-    srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qq/qq.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
