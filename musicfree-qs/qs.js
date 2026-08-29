@@ -280,7 +280,7 @@
     author: 'tianpeng',
     description: '汽水音乐（字节 Luna）音源：搜索/取链/歌词/排行榜/歌单导入。' +
       '搜索、取链、歌词、排行榜、歌单导入均可免签调用；按标签热门歌单依赖汽水原生签名，plain 客户端可能返回空（可在 userVariables 填汽水会话 Cookie 尝试解锁）。',
-    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qs/qs.js',
+    srcUrl: 'https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qs/qs.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
