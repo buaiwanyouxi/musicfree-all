@@ -623,7 +623,7 @@
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
       '播放取链三层兜底：①官方QQ(CgiGetVkey，需登录Cookie解锁) → ②首选备用 无名音乐网mvmp3(自动过人机验证) → ③次选备用 Tonzhon网易云匹配(tonzhon.com搜索+weapi取链，覆盖QQ的VIP/试听失效曲)。',
-    srcUrl: '',
+    srcUrl: 'https://raw.giteeusercontent.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
