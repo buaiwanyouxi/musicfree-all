@@ -152,6 +152,7 @@
     if (dur && dur < 1000) dur = dur * 1000;
     return {
       id: String(mid || src.songid || ''),
+      songmid: String(mid || ''),
       title: title,
       artist: artist,
       album: album,
@@ -191,7 +192,7 @@
     return raw;
   }
   async function autoVerify() {
-    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: 9000 });
+    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: 9000, validateStatus: function () { return true; } });
     var setCk = (r1.headers && r1.headers['set-cookie']) || [];
     var jar = {};
     setCk.forEach(function (c) {
@@ -315,7 +316,8 @@
         headers: { 'User-Agent': TZ_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://tonzhon.com/' },
         timeout: 15000,
       })
-      .then(function (r) { return r.data; });
+      .then(function (r) { return r.data; })
+      .catch(function () { return null; });
   }
   function flattenArtist(a) {
     if (!a) return '';
@@ -450,14 +452,18 @@
     return forceHttps(domain + purl);
   }
   async function getMediaSource(musicItem, quality) {
-    var mid = String(musicItem.id || musicItem.songmid || '');
+    var mid = String(musicItem.songmid || musicItem.id || '');
     var name = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
     var errs = [];
     // 1) 官方 QQ 取链（免费曲完整链；VIP/未登录则失败进入兜底）
     if (mid) {
       try {
         var official = await qqOfficialGetUrl(mid);
-        if (official) return { url: official, headers: { Referer: REFERER, 'User-Agent': CHROME_UA, 'Accept': '*/*' } };
+        // 注意：官方链【不带 headers】返回——经与官方 maotoumao/MusicFreePlugins 的 qq.js 对齐，
+        // 其 getMediaSource 仅返回 {url} 不含 headers；移动端播放器（ExoPlayer/track-player）对
+        // 取链时附带的 Referer/User-Agent 等非必要 headers 敏感，易在歌单/排行榜连续播放时触发
+        // 原生层异常导致应用闪退。QQ CDN 本身无需这些 header 即可正常返回音频（已实测），故此处不返回。
+        if (official) return { url: official };
       } catch (e) { errs.push('QQ官方:' + e.message); }
     }
     // 2) 首选备用：无名音乐网 mvmp3（自动过人机验证）
@@ -622,7 +628,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.4',
+  version: '0.0.5',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
