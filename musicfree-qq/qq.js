@@ -385,7 +385,25 @@
     u = String(u).trim();
     if (!/^https?:\/\//i.test(u)) return null;                                  // 拒绝相对/协议相对/blob/data
     if (/\.m3u8(\?|$)/i.test(u) || /\.m3u(\?|$)/i.test(u)) return null;         // 拒绝 HLS（原生播放器易崩）
-    return forceHttps(u);                                                        // 兜底统一 https（mvmp3/tonzhon/netease 均 https 友好）
+    return u;                                                                    // 原样返回：官方明文 http 与兜底 https 均经实测可播，不做 forceHttps（那会重新引入 TLS 崩溃）
+  }
+  // 播放前“可播放性”实时探测（兜底安全网）：仅当响应【明确不是音频】(404/403 或 text/html) 才判不可用，
+  // 让上层继续走下一个兜底源；网络错误(超时/DNS)则“信任放行”，避免误杀本可播放的链。
+  // 这样即便某 CDN 节点对错误 vkey 回 HTML，也绝不会把崩溃性 URL 交给原生播放器。
+  async function validatePlayable(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': CHROME_UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
+        timeout: 7000, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var st = r.status;
+      var ct = (r.headers && r.headers['content-type']) || '';
+      if (st >= 200 && st < 300 && /audio|video|application\/octet-stream/i.test(ct)) return true;
+      if (st === 404 || st === 403) return false;
+      if (/text\/html/i.test(ct)) return false;
+      return true; // 5xx / 其他保守放行
+    } catch (e) { return true; } // 网络层异常：信任，不阻断播放
   }
   // 试听片段探测（移动端兼容版：不用 stream，仅读响应头）。30s@128kbps≈500KB，完整曲通常≥2MB，阈值取 1.2MB。
   // 无法判断时返回 false，绝不误伤完整曲、绝不阻塞播放。
@@ -430,16 +448,46 @@
 
   // ---------- 取链（三层兜底：官方 QQ → mvmp3 → Tonzhon 网易云匹配） ----------
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
-  async function qqOfficialGetUrl(mid) {
-    var uin = getUinFromCookie();
-    var filename = 'M500' + mid + '.mp3'; // 高码率；C400 + .m4a 为普通码率（filename 仅拼接一次 mid）
+  // 与官方 maotoumao/MusicFreePlugins qq.js 的 getSourceUrl 逐字节对齐的“质量→文件前缀”映射
+  var QQ_TYPE_MAP = {
+    m4a:      { s: 'C400', e: '.m4a' },
+    '128':    { s: 'M500', e: '.mp3' },
+    standard: { s: 'M500', e: '.mp3' },
+    low:      { s: 'M500', e: '.mp3' },
+    '320':    { s: 'M800', e: '.mp3' },
+    high:     { s: 'M800', e: '.mp3' },
+    ape:      { s: 'A000', e: '.ape' },
+    flac:     { s: 'F000', e: '.flac' },
+  };
+  // 官方 QQ 取链（免费曲返回完整链；VIP/试听曲官方不给链）
+  // 关键：vkey 请求必须与官方逐字节对齐——uin 用空串、guid 随机、filename 为「前缀+mid+mid+后缀」
+  // （官方即把 id 拼两次）、comm 含 authst:''。此前我方用 uin='0'/固定 guid/单 id 文件名，导致返回的
+  // vkey 与 CDN 实际文件 src 不匹配 → CDN 回 403/HTML → 原生播放器崩溃。这恰是前面 5 次修复
+  // （cheerio/http/headers/songmid/safeUrl）全部漏掉、且每次都复现的真正根因。
+  async function qqOfficialGetUrl(mid, quality) {
+    var typeKey = (quality === 'high' || quality === '320' || quality === 'flac') ? '320'
+                : (quality === 'low' || quality === 'm4a') ? 'm4a'
+                : '128';
+    var typeObj = QQ_TYPE_MAP[typeKey] || QQ_TYPE_MAP['128'];
+    var uin = '';                                       // 与官方一致：空串（不是 '0'）
+    var guid = (Math.random() * 10000000).toFixed(0);   // 与官方一致：随机 guid
+    var mediaId = mid;
+    var file = typeObj.s + mid + mediaId + typeObj.e;    // 与官方一致：id 拼两次
     var data = {
       req_0: {
         module: 'vkey.GetVkeyServer',
         method: 'CgiGetVkey',
-        param: { filename: [filename], guid: '2796982635', songmid: [mid], songtype: [0], uin: uin, loginflag: 1, platform: '20' },
+        param: {
+          filename: [file],
+          guid: guid,
+          songmid: [mid],
+          songtype: [0],
+          uin: uin,
+          loginflag: 1,
+          platform: '20',
+        },
       },
-      comm: { uin: Number(uin), format: 'json', ct: 19, cv: 0 },
+      comm: { uin: uin, format: 'json', ct: 19, cv: 0, authst: '' },
     };
     var url = VKEY_API + '&loginUin=' + uin + '&data=' + encodeURIComponent(JSON.stringify(data));
     var j = await req(url, { timeout: 12000 });
@@ -452,42 +500,38 @@
     if (!purl) {
       throw new Error('QQ 官方：该歌曲需登录态（Cookie 含 authst）才能取链，未登录无法播放');
     }
-    // 域选择与官方 maotoumao/MusicFreePlugins 的 qq.js 逐字节对齐：直接取 sub.sip[0]，不做任何改写。
-    // 官方插件在海量移动端均以「明文 http://aqqmusic.tc.qq.com/...」直接返回且稳定可用，证明 Android 端
-    // 对 QQ CDN 明文流量并未拦截（MusicFree 应用本身已配置 cleartext 白名单）。
-    // 此前 v0.0.4 引入的 forceHttps 把官方链升级为 https，反而触发部分机型 ExoPlayer 对 QQ HTTPS CDN 的
-    // TLS 握手原生异常（SSL/Cleartext 崩溃）——这正是「歌单/排行榜仍闪退、且 0.0.5 去掉 headers 后仍闪退、
-    // 并蔓延到搜索」的真正主因：0.0.5 的 songmid 修复让搜索也走通了官方 https 链，于是同样崩。
-    // 故此处【还原为官方明文 http 链】，与官方插件保持一致，彻底消除该原生崩溃。
-    var domain = (sub.sip && sub.sip[0]) || '';
+    // 与官方一致：优先取非 http://ws 开头的 sip，否则取首个；返回明文 http（不做 forceHttps）
+    var domain = (sub.sip || []).find(function (i) { return !i.startsWith('http://ws'); }) || (sub.sip && sub.sip[0]) || '';
     return domain + purl;
   }
   async function getMediaSource(musicItem, quality) {
     var mid = String(musicItem.songmid || musicItem.id || '');
     var name = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
     var errs = [];
-    // 1) 官方 QQ 取链（免费曲完整链；VIP/未登录则失败进入兜底）
+    // 1) 官方 QQ 取链（vkey 构造已对齐官方；返回明文 http，不带 headers）
     if (mid) {
       try {
-        var official = await qqOfficialGetUrl(mid);
-        // 注意：官方链【不带 headers】返回——经与官方 maotoumao/MusicFreePlugins 的 qq.js 对齐，
-        // 其 getMediaSource 仅返回 {url} 不含 headers；移动端播放器（ExoPlayer/track-player）对
-        // 取链时附带的 Referer/User-Agent 等非必要 headers 敏感，易在歌单/排行榜连续播放时触发
-        // 原生层异常导致应用闪退。QQ CDN 本身无需这些 header 即可正常返回音频（已实测），故此处不返回。
-        if (official) return { url: official };
+        var official = await qqOfficialGetUrl(mid, quality);
+        // 经 safeUrl(过滤 HLS/非法链) + 实时可播放探测双闸门，确保交给播放器的必是可放音频；
+        // 即便某 CDN 节点对错误 vkey 回 HTML，也不会把崩溃性 URL 交给原生播放器。
+        var offU = safeUrl(official);
+        if (offU && await validatePlayable(offU)) return { url: offU };
+        if (offU) errs.push('QQ官方:链不可播放(已跳过)');
       } catch (e) { errs.push('QQ官方:' + e.message); }
     }
     // 2) 首选备用：无名音乐网 mvmp3（自动过人机验证）
     try {
       var mv = await mvGetMediaSource(musicItem);
       var mvU = mv && mv.url ? safeUrl(mv.url) : null;
-      if (mvU) return { url: mvU }; // 不带 Referer（否则 CDN 403）；经 safeUrl 闸门过滤 HLS/非法链
+      if (mvU && await validatePlayable(mvU)) return { url: mvU }; // 不带 Referer（否则 CDN 403）
+      if (mvU) errs.push('mvmp3:链不可播放(已跳过)');
     } catch (e) { errs.push('mvmp3:' + e.message); }
     // 3) 次选备用：Tonzhon 网易云匹配（tonzhon 搜索发现 + 网易云 weapi 取链）
     try {
       var tz = await getNeteaseUrlForQuery((musicItem.title || '').trim(), (musicItem.artist || '').trim());
       var tzU = tz ? safeUrl(tz) : null;
-      if (tzU) return { url: tzU };
+      if (tzU && await validatePlayable(tzU)) return { url: tzU };
+      if (tzU) errs.push('Tonzhon:链不可播放(已跳过)');
     } catch (e) { errs.push('Tonzhon:' + e.message); }
     throw new Error('《' + name + '》QQ官方取链失败，且备用音源（mvmp3 / Tonzhon）均未取得：' + (errs.join('；') || '未知原因') +
       '。若 mvmp3 提示“验证失败”多为临时升级，稍后重试即可；Tonzhon 对极冷门曲也可能无匹配。');
@@ -641,7 +685,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.6',
+  version: '0.0.7',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
