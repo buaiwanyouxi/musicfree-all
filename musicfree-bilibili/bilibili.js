@@ -31,7 +31,18 @@
  * ============================================================================
  * 【版本与作者】
  *   author : tianpeng
- *   version: V0.0.7
+ *   version: V0.0.10
+ *
+ * 【关键修复说明（V0.0.9 → V0.0.10）】
+ *   症状：桌面端「我的收藏夹」正常显示，但移动端在插件设置填入 SESSDATA/cookie 后，
+ *         收藏夹仍不显示（或仅显示「⚠️ 收藏夹加载失败：请先填写 SESSDATA」）。
+ *   真实根因：MusicFree 移动端加载器把 `env` 仅作为「插件方法参数」注入
+ *           （Function(require, __musicfree_require, module, exports, console, env, URL, process)），
+ *           部分移动端构建下裸全局 `env` 在深层辅助函数（getVars/getRawCookie）中读不到，
+ *           导致 getFavoriteFolders 判定未登录而静默失败。
+ *   修复：① 新增模块级 `_envRef`，各导出方法入口写入「方法参数 env」；
+ *         ② getVars/isMobile 改为 resolveEnv()：优先方法参数 env > _envRef > 裸全局 env；
+ *         ③ 保证桌面（全局）/ 移动端（参数）均能稳定读到用户凭证，收藏夹双端一致。
  *
  * 【关键修复说明（V0.0.6 → V0.0.7）】
  *   症状：收藏夹✓、播放✓，但 BV16ahK6eE21 等「网页端明明有 AI 字幕」的视频在插件上不显示。
@@ -97,16 +108,23 @@
   var axios = reqFn('axios');
 
   // 读取 MusicFree 注入的用户变量（登录凭证 / 配置项）。
-  // 关键：与所有「能跑通」的参考插件（musicfree-bilibili / musicfree-bili / martin65536 bilibili.js）
-  // 保持一致——直接读取沙箱提供的裸全局 `env`，不做任何捕获/回退。
-  // 原因：MusicFree 的 getUserVariables() 按 platform id 隔离，且 `env` 在不同加载器中
-  // 可能以全局 / 模块参数形式注入；裸 `env` 是经实测唯一稳定的取法。
-  function getVars() {
+  // 跨端兼容关键：桌面端 `env` 作为沙箱全局注入；移动端 `env` 仅作为插件「方法参数」注入
+  // （见 MusicFree mobile 加载器：Function(require, __musicfree_require, module, exports, console, env, URL, process)）。
+  // 因此 getVars 的解析优先级为：方法显式传入的 env 参数 > 各导出方法入口写入的 _envRef > 裸全局 env。
+  // 这样无论桌面还是移动端，都能稳定读到用户填入的 SESSDATA / cookie，彻底规避「移动端读不到凭证」的问题。
+  var _envRef = null; // 由各导出方法在入口处写入（来自 MusicFree 传入的方法参数 env）
+  function resolveEnv(e) {
+    var ev = e || _envRef;
+    if (!ev && typeof env !== 'undefined' && env) ev = env;
+    return ev || null;
+  }
+  function getVars(e) {
+    var ev = resolveEnv(e);
     try {
-      if (typeof env !== 'undefined' && env && typeof env.getUserVariables === 'function') {
-        return env.getUserVariables() || {};
+      if (ev && typeof ev.getUserVariables === 'function') {
+        return ev.getUserVariables() || {};
       }
-    } catch (e) { /* 本地测试环境无 env */ }
+    } catch (err) { /* 本地测试环境无 env */ }
     return {};
   }
 
@@ -225,8 +243,9 @@
   // 故取链时移动端优先 fnval=0 的 durl 合并流（.mp4 单文件，兼容性最强）。
   function isMobile() {
     try {
-      if (typeof env !== 'undefined' && env && env.os) {
-        var os = String(env.os).toLowerCase();
+      var ev = resolveEnv();
+      if (ev && ev.os) {
+        var os = String(ev.os).toLowerCase();
         if (os === 'android' || os === 'ios') return true;
         if (os.indexOf('android') >= 0 || os.indexOf('ios') >= 0) return true;
       }
@@ -768,7 +787,8 @@
   }
 
   /* ===================== UP主作品（WBI，纯 JS 签名） ===================== */
-  async function getArtistWorks(artistItem, page, type) {
+  async function getArtistWorks(artistItem, page, type, env) {
+    _envRef = env;
     const queryHeaders = {
       'user-agent': getUserUA(), accept: '*/*', 'accept-encoding': 'gzip, deflate, br, zstd',
       origin: 'https://space.bilibili.com', 'sec-fetch-site': 'same-site',
@@ -817,7 +837,8 @@
   //      注意只挂 SESSDATA，绝不挂 buvid（buvid 会触发 B站 HTTP 412，见 musicfree-bilibili 注释）；
   //   ② 匿名 playurl：未登录用户仍可播公开视频；
   //   ③ fnval=0 durl 合并流：最终兜底，桌面端兼容性最强。
-  async function getMediaSource(musicItem, quality) {
+  async function getMediaSource(musicItem, quality, env) {
+    _envRef = env;
     const logTag = '[getMediaSource] ' + (musicItem.bvid || musicItem.aid || 'unknown');
     try {
       let cid = musicItem.cid;
@@ -908,7 +929,8 @@
   }
 
   // 补全单曲信息（点击播放前可选调用）
-  async function getMusicInfo(musicItem) {
+  async function getMusicInfo(musicItem, env) {
+    _envRef = env;
     const bvid = musicItem.bvid, aid = musicItem.aid;
     if (!bvid && !aid) return {};
     try {
@@ -945,7 +967,8 @@
   }
 
   /* ===================== 专辑多P展开（bili.js 原有） ===================== */
-  async function getAlbumInfo(albumItem) {
+  async function getAlbumInfo(albumItem, env) {
+    _envRef = env;
     const cidRes = await getCid(albumItem.bvid, albumItem.aid);
     const _ref2 = (cidRes && cidRes.data) || {};
     const cid = _ref2.cid;
@@ -962,7 +985,8 @@
   }
 
   /* ===================== 榜单入口（合并：每周必刷/入站必刷/21分区/我的收藏夹） ===================== */
-  async function getTopLists() {
+  async function getTopLists(_, page, env) {
+    _envRef = env;
     // 1) 入站必刷（个性化推荐，需登录）
     const precious = {
       title: '入站必刷',
@@ -1000,14 +1024,16 @@
     return [weekly, precious, ranking, fav];
   }
   // 歌单详情：收藏夹数字 id 走收藏夹；其余走公开榜单
-  async function getMusicSheetInfo(sheetItem, page) {
+  async function getMusicSheetInfo(sheetItem, page, env) {
+    _envRef = env;
     const id = String(sheetItem.id || '');
     if (id.indexOf('__') === 0) throw new Error(sheetItem.description || '该收藏夹项无法加载');
     if (/^\d+$/.test(id)) return loadSheetVideos(sheetItem, page);
     return getPublicTopListDetail(sheetItem, page);
   }
   // 榜单详情：按 id 路由
-  async function getTopListDetail(topListItem, page) {
+  async function getTopListDetail(topListItem, page, env) {
+    _envRef = env;
     const id = String(topListItem.id || '');
     if (id === '__fav_error__' || id === '__fav_empty__' || id.indexOf('__') === 0) {
       throw new Error(topListItem.description || '该收藏夹项无法加载');
@@ -1049,7 +1075,8 @@
     }
     return all;
   }
-  async function importMusicSheet(urlLike) {
+  async function importMusicSheet(urlLike, env) {
+    _envRef = env;
     if (!urlLike) throw new Error('请提供收藏夹链接、视频链接或收藏夹 ID');
     // 1) 视频链接（支持多 P 分集导入为歌单）
     if (/BV[0-9A-Za-z]+/.test(String(urlLike))) {
@@ -1106,7 +1133,8 @@
     if (!descText) return null;
     return { id: '__intro__', nickName: '📝 视频简介', comment: descText, avatar: musicItem.artwork || undefined };
   }
-  async function getMusicComments(musicItem, page) {
+  async function getMusicComments(musicItem, page, env) {
+    _envRef = env;
     const aid = musicItem.aid;
     if (!aid) return { isEnd: true, data: [] };
     const currentPage = page || 1;
@@ -1162,7 +1190,8 @@
       return `[${secondsToLrcTime(from)}]${item.content || ''}`;
     }).join('\n');
   }
-  async function getLyric(musicItem) {
+  async function getLyric(musicItem, env) {
+    _envRef = env;
     if (!isLoggedIn()) {
       // 诊断：明确告知用户当前插件是否真正读到了登录凭证，便于排查「歌词不显示」
       let diag = {};
@@ -1252,7 +1281,7 @@
   var plugin = {
     platform: 'Bilibili',
     appVersion: '>=0.0',
-    version: 'V0.0.9',
+    version: 'V0.0.10',
     author: 'tianpeng',
     cacheControl: 'no-store',
     srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-bilibili/bilibili.js',
@@ -1298,7 +1327,8 @@
         '获取字幕需在插件设置填 SESSDATA（含SESSDATA），匿名无法获取AI字幕。',
       ],
     },
-    async search(keyword, page, type) {
+    async search(keyword, page, type, env) {
+      _envRef = env;
       if (type === 'album' || type === 'music') return await searchAlbum(keyword, page);
       if (type === 'artist') return await searchArtist(keyword, page);
     },
