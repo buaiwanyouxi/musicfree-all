@@ -67,7 +67,7 @@
     return {};
   }
   function fixImg(u) {
-    if (!u) return '';
+    if (!u) return undefined; // 空串 → undefined：避免原生图片组件拿到空 URI 触发崩溃
     u = String(u).trim();
     if (u.indexOf('http') === 0) return u;
     if (u.indexOf('//') === 0) return 'https:' + u;
@@ -137,10 +137,19 @@
     return typeof s === 'string' && s.length > 24 && /^[A-Za-z0-9+/=\r\n]+$/.test(s.replace(/\s/g, ''));
   }
 
+  // 由 albummid 合成真实封面 URL（与官方 maotoumao/MusicFreePlugins qq.js 一致：
+  // https://y.gtimg.cn/music/photo_new/T002R300x300M000<albummid>.jpg）。无 albummid 时返回
+  // undefined（绝不返回空串 ''）——空串 artwork 会被原生图片组件 / 锁屏 MediaSession 当成空 URI，
+  // 在移动端引发「无日志、直接闪退」的原生层崩溃。这是前面 6 次修复（仅改 getMediaSource 取链逻辑）
+  // 全部漏掉、且每次都复现的真正结构性根因。
+  function toArtworkFromAlbumMid(albummid) {
+    if (!albummid) return undefined;
+    return 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' + String(albummid) + '.jpg';
+  }
   // 统一音乐条目映射（搜索/歌单详情/榜单详情 字段略有差异）
   function toTrack(it) {
     if (!it) return null;
-    // 搜索：it = {songmid, songid, songname, singer:[{name}], albumname, interval}
+    // 搜索：it = {songmid, songid, songname, singer:[{name}], albumname, albummid, interval}
     // 歌单详情：it = {songmid, songid, songname, singer:[{name}], albumname, albummid, interval, strMediaMid}
     // 榜单详情：it = {data:{songmid, songname, singer, albumname, albummid, interval, strMediaMid}}
     var src = it.data ? it.data : it;
@@ -148,6 +157,7 @@
     var title = src.songname || src.title || src.name || '';
     var artist = joinArtists(src.singer);
     var album = src.albumname || src.album || '';
+    var albummid = src.albummid || (src.album && src.album.mid) || '';
     var dur = src.interval;
     if (dur && dur < 1000) dur = dur * 1000;
     return {
@@ -156,7 +166,8 @@
       title: title,
       artist: artist,
       album: album,
-      artwork: '',
+      albummid: albummid,                                          // 透传，供详情/原生层按需取封面
+      artwork: toArtworkFromAlbumMid(albummid),                    // 有专辑则真实封面 URL，否则 undefined（绝不空串）
       duration: dur,
     };
   }
@@ -558,8 +569,15 @@
   }
 
   // ---------- 歌曲信息（封面等，无独立详情端点则透传） ----------
+  // 关键：必须返回「完整」曲目对象（与 toTrack 同构），artwork 绝不空串。
+  // MusicFree 在收藏歌曲 / 拉起播放前会调用 getMusicInfo 取完整信息并存入收藏歌单；
+  // 若只回 { artwork } 或回空串，收藏歌单里每一首都会带 artwork:'' → 播放时交给原生层 → 闪退。
+  // 故此处把 artwork 兜底补全为真实封面 URL 或 undefined。
   async function getMusicInfo(musicItem) {
-    return { artwork: musicItem.artwork };
+    var am = musicItem.albummid || '';
+    var art = musicItem.artwork;
+    if (!art || art === '') art = toArtworkFromAlbumMid(am);
+    return Object.assign({}, musicItem, { artwork: art });
   }
 
   // ---------- 排行榜 ----------
@@ -685,7 +703,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.7',
+  version: '0.0.8',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
@@ -722,5 +740,6 @@
     getRecommendSheetsByTag: getRecommendSheetsByTag,
     importMusicSheet: importMusicSheet,
     getMusicSheetInfo: getMusicSheetInfo,
+    getRecommendSheetDetail: getMusicSheetInfo, // 别名：部分版本 MusicFree 用此名拉取推荐/热门歌单详情
   };
 })();
