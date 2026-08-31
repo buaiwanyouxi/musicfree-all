@@ -39,6 +39,11 @@
       "name": "哔哩哔哩",
       "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@c8c1d038bcb6dacf6ab6c137eb4a3a81dce95bc9/musicfree-bilibili/bilibili.js",
       "id": 8
+    },
+    {
+      "name": "天蓬聚合",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@456fd6ffbb0cd049e43e8b2f6a77b37d00d3da87/musicfree-tianpeng/tianpengjh.js",
+      "id": 9
     }
   ]
 }
