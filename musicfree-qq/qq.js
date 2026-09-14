@@ -1,5 +1,5 @@
 // QQ音乐（腾讯系）音源插件
-// 平台：QQ音乐  author：tianpeng  version：0.0.1
+// 平台：QQ音乐  author：tianpeng  version：0.1.1
 //
 // 接口契约（经运行时真实联网探测 + 研读 jsososo/QQMusicApi 开源实现得出，全部免签端点）：
 //   搜索        GET  c.y.qq.com/soso/fcgi-bin/client_search_cp?aggr=1&cr=1&flag_qc=0&p=<page>&n=30&w=<kw>&format=json
@@ -12,17 +12,34 @@
 //   歌单分类    GET  c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_tag_conf.fcg?format=json&inCharset=utf8&outCharset=utf-8
 //   取链        GET  u.y.qq.com/cgi-bin/musicu.fcg?-=getplaysongvkey&...&data={vkey.GetVkeyServer.CgiGetVkey}  (免签，但 purl 需登录态 authst cookie，未登录返回空)
 //
-// 播放取链三层兜底（参考本仓库 wy.js / kugou_mvmp3.js / xiage.js）：
-//   ① 官方 QQ CgiGetVkey（需登录 Cookie；免费曲返回完整链，VIP/试听曲官方不给链）
-//   ② 首选备用：无名音乐网 mvmp3.com（自动过人机验证，独立跨源库）
-//   ③ 次选备用：Tonzhon 网易云匹配（tonzhon.com 按歌名搜到网易云同名曲，纯 JS weapi 取链；不依赖 QQ 登录态，对 QQ 的 VIP/试听曲有效）
-// 官方取链失败时不再直接抛错，而是依次尝试 ② ③，最大化“有歌可播”。
+// ============ v0.1.0 核心重构：取链「竞速并发」而非「顺序」 ============
+//   ① 官方 QQ CgiGetVkey 作为【优先快路径】（最多等 7s）；
+//   ② 无名音乐网 mvmp3 与 ③ Tonzhon 网易云匹配 与官方【并发】启动，
+//      Promise.any 取首个成功链 —— 总耗时为「单层 worst-case」而非「三层之和」，根治沙箱 10s 超时。
+//   - 整段 9s AbortController 软上限：超时即中止在途请求，返回「已通过身份校验的最佳链」而非干等全失败。
+//   - mvmp3 登录态 Cookie 在插件加载 / 搜索时【后台预热】并周期续期，播放时不再同步等 9s 人机验证。
+//   - 备用源匹配升级为【歌名 + 作者 + 时长】多重身份校验（isGoodMatch），避免错播。
+//   - 移除昂贵的「试听片段嗅探」(looksLikePreview, 5s×N)，以身份校验替代安全网，显著降延迟。
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
   // 无名音乐网(mvmp3) 搜索结果解析采用「纯正则」实现，不依赖 cheerio —— 移动端沙箱不注入 cheerio，
   // 若用 cheerio.load 解析则移动端兜底音源完全失效（解析返回空 → 取链失败 → 非免费曲在歌单/排行榜连续
   // 播放时易触发崩溃）。纯正则解析在桌面端/移动端一致可用，故彻底移除 cheerio 依赖。
+
+  // Promise.any 兜底（部分移动端 JS 引擎未内置）：首个 fulfilled 即胜，全 reject 则 reject 聚合错误
+  if (typeof Promise.any !== 'function') {
+    Promise.any = function (proms) {
+      var ps = Array.prototype.slice.call(proms);
+      if (!ps.length) return Promise.reject(new Error('empty'));
+      return new Promise(function (resolve, reject) {
+        var errs = [], done = 0;
+        ps.forEach(function (p, i) {
+          Promise.resolve(p).then(resolve, function (e) { errs[i] = e; if (++done === ps.length) reject(errs); });
+        });
+      });
+    };
+  }
 
   // ---------- 端点 ----------
   var HOST = 'https://c.y.qq.com';
@@ -94,6 +111,7 @@
       validateStatus: function () { return true; },
     };
     if (opts.params) config.params = opts.params;
+    if (opts.signal) config.signal = opts.signal; // 透传 AbortController 信号，支持整段软上限中止
     var r = await axios.get(url, config);
     var raw = r.data;
     if (typeof raw === 'string') raw = stripJsonp(raw);
@@ -175,6 +193,7 @@
   // ---------- 搜索 ----------
   async function search(query, page, type) {
     if (type && type !== 'music') return { isEnd: true, data: [] };
+    warmMvCookie(); // 搜索即预热 mvmp3 会话，用户点歌前通常先经过搜索，播放时 Cookie 多半已热
     var r = await req(SEARCH_API, {
       params: { aggr: 1, cr: 1, flag_qc: 0, p: Math.max(1, page || 1), n: 30, w: query, format: 'json' },
     });
@@ -202,8 +221,8 @@
     if (raw.indexOf('=') === -1) return 'PHPSESSID=' + raw;
     return raw;
   }
-  async function autoVerify() {
-    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: 9000, validateStatus: function () { return true; } });
+  async function autoVerify(signal) {
+    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: 9000, signal: signal, validateStatus: function () { return true; } });
     var setCk = (r1.headers && r1.headers['set-cookie']) || [];
     var jar = {};
     setCk.forEach(function (c) {
@@ -217,21 +236,22 @@
     var csrf = m ? m[1] : '';
     await axios.post(MV_BASE + '/', 'csrf_token=' + encodeURIComponent(csrf) + '&human_check=on', {
       headers: { ...MV_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded', Referer: MV_BASE + '/', Cookie: ck },
-      timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; },
+      timeout: 9000, maxRedirects: 5, signal: signal, validateStatus: function () { return true; },
     });
     return ck;
   }
-  async function ensureMvCookie(forceAuto) {
+  async function ensureMvCookie(forceAuto, signal) {
     var now = Date.now();
     if (!forceAuto && _mvCookie && (now - _mvCookieAt) < MV_COOKIE_TTL) return _mvCookie;
     var userCk = normCookie(getVars().mvmp3_cookie);
     if (userCk && !forceAuto) { _mvCookie = userCk; _mvCookieAt = now; _mvCookieUser = true; return _mvCookie; }
-    var fresh = await autoVerify();
+    var fresh = await autoVerify(signal);
     _mvCookie = fresh; _mvCookieAt = now; _mvCookieUser = false; return _mvCookie;
   }
   function mvIsVerify(html) { return /安全人机验证|我不是人机|verifyForm/.test(html || ''); }
-  // 纯正则解析：每条结果形如 <a href="/mp3/<32hex>.html" ...><img ... alt="歌名/歌手 - 曲名">...
+  // 纯正则解析：每条结果形如 <a href="/mp3/<32hex>.html" ... alt="【歌手 - 歌名】">...
   // 不依赖 cheerio，移动端沙箱缺 cheerio 时也能正常解析（这是移动端首选备用音源可用的关键）。
+  // mvmp3 返回格式为【歌手 - 歌名】：以 ' - ' 分隔，前为歌手、后为歌名（与 Tonzhon 的 {name,artist} 字段约定相反）。
   function mvParseItems(html) {
     if (!html || typeof html !== 'string') return [];
     var items = [], seen = {};
@@ -244,6 +264,10 @@
       var title = raw, artist = '';
       var idx = raw.indexOf(' - ');
       if (idx > 0) { artist = raw.substring(0, idx).trim(); title = raw.substring(idx + 3).trim(); }
+      // 清洗首尾【】/[]（mvmp3 常包裹为【歌手 - 歌名】），确保歌手/歌名干净
+      artist = artist.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+      title = title.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+      if (!title) continue;
       items.push({ id: id, title: title, artist: artist });
     }
     return items;
@@ -251,18 +275,30 @@
   function norm(s) {
     return (s || '').toLowerCase().replace(/\s+/g, '').replace(/[()（）【】\[\]《》、，。,.]/g, '');
   }
-  function mvRank(cands, musicItem) {
-    var t = norm(musicItem.title), ar = norm(musicItem.artist);
-    var scored = cands.map(function (c) {
-      var ct = norm(c.title), ca = norm(c.artist), s = 0;
-      if (t && (ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0)) s += 2;
-      if (ar && ca && (ca.indexOf(ar) >= 0 || ar.indexOf(ca) >= 0)) s += 1;
-      return { c: c, s: s };
-    }).filter(function (x) { return x.s > 0; });
-    scored.sort(function (a, b) { return b.s - a.s; });
-    return scored.map(function (x) { return x.c; });
+  // 时长一致性校验：两端都有时长且单位化为秒后，容差 3s 即视为同一曲
+  function durMatch(a, b, tol) {
+    if (!a || !b) return true; // 任一侧缺失 → 不据此否决
+    var sa = a >= 1000 ? a / 1000 : a;
+    var sb = b >= 1000 ? b / 1000 : b;
+    return Math.abs(sa - sb) <= (tol || 3);
   }
-  async function mvPlayUrl(hash, cookie) {
+  // 【v0.1.0 多重身份校验】歌名 + 作者 + 时长（时长可选），三者通过才算同一首，避免错播
+  function isGoodMatch(cand, musicItem) {
+    var t = norm(musicItem.title), ar = norm(musicItem.artist);
+    var ct = norm(cand.title), ca = norm(cand.artist);
+    if (!t || !ct) return false;
+    if (ct.indexOf(t) < 0 && t.indexOf(ct) < 0) return false;           // 歌名必须互含
+    if (ar && ca && ca.indexOf(ar) < 0 && ar.indexOf(ca) < 0) return false; // 作者必须互含（若有）
+    return durMatch(musicItem.duration, cand.duration, 3);               // 时长一致（可选）
+  }
+  function matchScore(c, musicItem) {
+    var t = norm(musicItem.title), ar = norm(musicItem.artist);
+    var ct = norm(c.title), ca = norm(c.artist), s = 0;
+    if (t && (ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0)) s += 2;
+    if (ar && ca && (ca.indexOf(ar) >= 0 || ar.indexOf(ca) >= 0)) s += 1;
+    return s;
+  }
+  async function mvPlayUrl(hash, cookie, signal) {
     var r = await axios.post(MV_BASE + '/style/js/play.php', 'id=' + hash + '&type=dance', {
       headers: {
         'User-Agent': MV_UA,
@@ -271,41 +307,47 @@
         'Referer': MV_BASE + '/mp3/' + hash + '.html', // 给 play.php 用，不是给音频 CDN 的
         'Cookie': cookie,
       },
-      timeout: 9000, validateStatus: function () { return true; },
+      timeout: 9000, signal: signal, validateStatus: function () { return true; },
     });
     return r.data;
   }
-  async function mvSearch(keyword, cookie) {
+  async function mvSearch(keyword, cookie, signal) {
     var r = await axios.get(MV_BASE + '/so/' + encodeURIComponent(keyword || '') + '.html', {
       headers: { ...MV_HEADERS, 'Cookie': cookie },
-      timeout: 9000, validateStatus: function () { return true; },
+      timeout: 9000, signal: signal, validateStatus: function () { return true; },
     });
     if (mvIsVerify(r.data)) throw new Error('无名音乐网自动过验证失败（可能已升级为需手动验证），将自动回退 Tonzhon');
     return mvParseItems(r.data);
   }
-  async function mvGetMediaSource(musicItem) {
+  // onMatch(u)：记录「已通过身份校验 + safeUrl 过滤」的次优链，供整段超时/全失败时兜底返回
+  async function mvGetMediaSource(musicItem, signal, onMatch) {
     var kw = (musicItem.title || '').trim() || (musicItem.artist || '').trim();
     if (!kw) throw new Error('歌曲标题为空，无法在无名音乐网检索');
-    var cookie = await ensureMvCookie();
+    var cookie = await ensureMvCookie(false, signal);
     var items;
     try {
-      items = await mvSearch(kw, cookie);
+      items = await mvSearch(kw, cookie, signal);
     } catch (e) {
       if (_mvCookieUser && /验证/.test(e.message)) {
         _mvCookie = null; _mvCookieUser = false;
-        cookie = await ensureMvCookie();
-        items = await mvSearch(kw, cookie);
+        cookie = await ensureMvCookie(false, signal);
+        items = await mvSearch(kw, cookie, signal);
       } else throw e;
     }
     if (!items.length) throw new Error('无名音乐网未找到：' + kw);
-    var ordered = mvRank(items, musicItem);
-    if (!ordered.length) ordered = items;
+    // 优先取通过多重身份校验的候选；无严格匹配则退化为按相关度排序
+    var matched = items.filter(function (c) { return isGoodMatch(c, musicItem); });
+    var ordered = (matched.length ? matched : items).slice().sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); });
     var lastErr = '';
-    for (var i = 0; i < Math.min(ordered.length, 5); i++) {
+    for (var i = 0; i < Math.min(ordered.length, 2); i++) { // 候选数 5→2，砍掉冗余延迟
       try {
-        var d = await mvPlayUrl(ordered[i].id, cookie);
-        if (d && d.url) return { url: d.url }; // 不带 Referer，否则 CDN 403
-        lastErr = d && d.msg ? String(d.msg) : '空链接';
+        var d = await mvPlayUrl(ordered[i].id, cookie, signal);
+        if (d && d.url) {
+          var u = safeUrl(d.url);
+          if (u && onMatch) onMatch(u); // 记录次优链（已过滤 HLS/非法链）
+          if (u && await validatePlayable(u, signal)) return { url: u }; // 不带 Referer（否则 CDN 403）
+          lastErr = d && d.msg ? String(d.msg) : '空链接';
+        }
       } catch (e) { lastErr = e.message; }
     }
     throw new Error('无名音乐网可取链候选均已下架/不可播放（' + (lastErr || '无可用链接') + '）');
@@ -318,14 +360,14 @@
   var TZ = 'https://tonzhon.com/api.php';
   var NETEASE_WEAPI = 'https://music.163.com/weapi/song/enhance/player/url/v1?csrf_token=';
   var TZ_UA = CHROME_UA;
-  function tzPost(types, extra) {
+  function tzPost(types, extra, signal) {
     var data = Object.assign({ types: types }, extra || {});
     var keys = Object.keys(data), parts = [];
     for (var i = 0; i < keys.length; i++) parts.push(keys[i] + '=' + encodeURIComponent(data[keys[i]]));
     return axios
       .post(TZ, parts.join('&'), {
         headers: { 'User-Agent': TZ_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://tonzhon.com/' },
-        timeout: 15000,
+        timeout: 15000, signal: signal,
       })
       .then(function (r) { return r.data; })
       .catch(function () { return null; });
@@ -368,7 +410,7 @@
     return { params: p2, encSecKey: WEAPI_ENC_SEC_KEY };
   }
   // 直连网易云 weapi 取播放直链（返回 http(s) CDN；下架/变灰曲返回 null）
-  function getNeteaseUrl(id) {
+  function getNeteaseUrl(id, signal) {
     try {
       var payload = JSON.stringify({ ids: '[' + id + ']', level: 'standard', encodeType: 'mp3', csrf_token: '' });
       var enc = weapiEncrypt(payload);
@@ -376,7 +418,7 @@
       return axios
         .post(NETEASE_WEAPI, reqBody, {
           headers: { 'User-Agent': TZ_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://music.163.com/' },
-          timeout: 10000,
+          timeout: 10000, signal: signal,
         })
         .then(function (r) {
           var u = r.data && r.data.data && r.data.data[0] ? r.data.data[0].url : null;
@@ -387,7 +429,6 @@
       return Promise.resolve(null);
     }
   }
-  function forceHttps(u) { return String(u).replace(/^http:\/\//i, 'https://'); }
   // 播放链安全闸门：仅放行「绝对 http(s) 直链」且非 HLS(.m3u8/.m3u) 的 URL。
   // 兜底音源（mvmp3 / Tonzhon）偶会回吐 HTML 页面、相对路径或 HLS 流，直接交给原生播放器会触发
   // 原生层崩溃（闪退）；此处一律拒之门外，让 getMediaSource 干净抛错（MusicFree 捕获后仅提示“播放失败”）。
@@ -399,14 +440,14 @@
     return u;                                                                    // 原样返回：官方明文 http 与兜底 https 均经实测可播，不做 forceHttps（那会重新引入 TLS 崩溃）
   }
   // 播放前“可播放性”实时探测（兜底安全网）：仅当响应【明确不是音频】(404/403 或 text/html) 才判不可用，
-  // 让上层继续走下一个兜底源；网络错误(超时/DNS)则“信任放行”，避免误杀本可播放的链。
+  // 让上层继续走下一个兜底源；网络错误(超时/DNS/Abort)则“信任放行”，避免误杀本可播放的链。
   // 这样即便某 CDN 节点对错误 vkey 回 HTML，也绝不会把崩溃性 URL 交给原生播放器。
-  async function validatePlayable(url) {
+  async function validatePlayable(url, signal) {
     if (!url || typeof url !== 'string') return false;
     try {
       var r = await axios.get(url, {
         headers: { 'User-Agent': CHROME_UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
-        timeout: 7000, validateStatus: function () { return true; }, maxRedirects: 5,
+        timeout: 7000, signal: signal, validateStatus: function () { return true; }, maxRedirects: 5,
       });
       var st = r.status;
       var ct = (r.headers && r.headers['content-type']) || '';
@@ -414,50 +455,39 @@
       if (st === 404 || st === 403) return false;
       if (/text\/html/i.test(ct)) return false;
       return true; // 5xx / 其他保守放行
-    } catch (e) { return true; } // 网络层异常：信任，不阻断播放
+    } catch (e) { return true; } // 网络层异常 / 被 AbortController 中止：信任，不阻断播放
   }
-  // 试听片段探测（移动端兼容版：不用 stream，仅读响应头）。30s@128kbps≈500KB，完整曲通常≥2MB，阈值取 1.2MB。
-  // 无法判断时返回 false，绝不误伤完整曲、绝不阻塞播放。
-  function looksLikePreview(url) {
-    if (!url || typeof url !== 'string') return Promise.resolve(false);
-    var u = forceHttps(url);
-    return axios
-      .get(u, {
-        headers: { 'User-Agent': TZ_UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
-        timeout: 5000,
-        validateStatus: function () { return true; },
-      })
-      .then(function (r) {
-        var cr = r.headers && r.headers['content-range'];
-        if (cr) {
-          var m = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
-          if (m) { var total = parseInt(m[1], 10); return total > 0 && total < 1.2 * 1024 * 1024; }
-        }
-        var cl = r.headers && r.headers['content-length'] ? parseInt(r.headers['content-length'], 10) : 0;
-        return cl > 0 && cl < 1.2 * 1024 * 1024;
-      })
-      .catch(function () { return false; });
-  }
-  // 按歌名+歌手匹配网易云并返回「首个完整」直链（遍历前若干候选，排除试听片段，返回首个完整链；全试听则退回最后一个非空）。
-  async function getNeteaseUrlForQuery(name, artist) {
+  // 【v0.1.0】按歌名+作者+时长多重校验匹配网易云，返回首个通过身份校验的直链。
+  // 候选数 8→3；移除昂贵的“试听片段嗅探”(5s×N)，以身份校验替代安全网，显著降延迟。
+  // onMatch(u)：记录次优链，供整段超时/全失败时兜底。
+  // 【v0.1.1 修复同名异长错播】已知时长却无任何“歌名+作者+时长”三重匹配 → 严拒退化为同名异长曲，
+  //   避免把 2:53 的错曲当成 4:05 播出来（如“王大毛 - 去年夏天”）。
+  async function getNeteaseUrlForQuery(name, artist, signal, musicItem, onMatch) {
     if (!name) return null;
-    var arr = await tzPost('search', { source: 'netease', name: name, pages: 1, count: 8 });
+    var arr = await tzPost('search', { source: 'netease', name: name, pages: 1, count: 8 }, signal);
     var list = Array.isArray(arr) ? arr : [];
     if (!list.length) return null;
-    var lastAny = null;
-    for (var k = 0; k < list.length; k++) {
-      var id = list[k] && list[k].id ? String(list[k].id) : null;
-      if (!id) continue;
-      var u = await getNeteaseUrl(id);
-      if (!u) continue;
-      lastAny = u; // 记录最近一个非空直链，供全试听时兜底
-      var isPrev = await looksLikePreview(u);
-      if (!isPrev) return u; // 完整命中
+    var hasKnownDur = !!(musicItem && musicItem.duration);
+    var matched = list.filter(function (it) {
+      return isGoodMatch({ title: it.name, artist: flattenArtist(it.artist), duration: it.duration || it.dt }, musicItem);
+    });
+    if (!matched.length && hasKnownDur) {
+      // 已知时长但搜索结果里没有一首时长对得上 → 直接拒掉，不放行同名异长错曲
+      throw new Error('Tonzhon：已知时长 ' + Math.round(musicItem.duration / 1000) + 's，但未找到时长匹配的音源，拒播错长曲');
     }
-    return lastAny; // 全是试听则退回最后一个非空（至少能播）
+    var cands = matched.length ? matched : list; // 时长未知才退化为相关度最高（最佳努力）
+    for (var k = 0; k < Math.min(cands.length, 3); k++) {
+      var id = cands[k] && cands[k].id ? String(cands[k].id) : null;
+      if (!id) continue;
+      var u = await getNeteaseUrl(id, signal);
+      if (!u) continue;
+      if (onMatch) onMatch(u);
+      return u; // 身份已通过【歌名+作者+时长】校验，直接返回首个命中链
+    }
+    return null;
   }
 
-  // ---------- 取链（三层兜底：官方 QQ → mvmp3 → Tonzhon 网易云匹配） ----------
+  // ---------- 取链（官方优先 + ②/③ 并发竞速 + 9s 软上限） ----------
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
   // 与官方 maotoumao/MusicFreePlugins qq.js 的 getSourceUrl 逐字节对齐的“质量→文件前缀”映射
   var QQ_TYPE_MAP = {
@@ -467,7 +497,7 @@
     low:      { s: 'M500', e: '.mp3' },
     '320':    { s: 'M800', e: '.mp3' },
     high:     { s: 'M800', e: '.mp3' },
-    ape:      { s: 'A000', e: '.ape' },
+    super:    { s: 'F000', e: '.flac' }, // 【v0.1.0】补齐无损：
     flac:     { s: 'F000', e: '.flac' },
   };
   // 官方 QQ 取链（免费曲返回完整链；VIP/试听曲官方不给链）
@@ -475,8 +505,8 @@
   // （官方即把 id 拼两次）、comm 含 authst:''。此前我方用 uin='0'/固定 guid/单 id 文件名，导致返回的
   // vkey 与 CDN 实际文件 src 不匹配 → CDN 回 403/HTML → 原生播放器崩溃。这恰是前面 5 次修复
   // （cheerio/http/headers/songmid/safeUrl）全部漏掉、且每次都复现的真正根因。
-  async function qqOfficialGetUrl(mid, quality) {
-    var typeKey = (quality === 'high' || quality === '320' || quality === 'flac') ? '320'
+  async function qqOfficialGetUrl(mid, quality, signal) {
+    var typeKey = (quality === 'high' || quality === '320' || quality === 'flac' || quality === 'super') ? '320'
                 : (quality === 'low' || quality === 'm4a') ? 'm4a'
                 : '128';
     var typeObj = QQ_TYPE_MAP[typeKey] || QQ_TYPE_MAP['128'];
@@ -501,7 +531,7 @@
       comm: { uin: uin, format: 'json', ct: 19, cv: 0, authst: '' },
     };
     var url = VKEY_API + '&loginUin=' + uin + '&data=' + encodeURIComponent(JSON.stringify(data));
-    var j = await req(url, { timeout: 12000 });
+    var j = await req(url, { timeout: 8000, signal: signal }); // 【v0.1.0】收紧至 8s，配合整段 9s 软上限
     var sub = j && j.req_0 && j.req_0.data;
     if (!sub || (j.req_0.code && j.req_0.code !== 0)) {
       throw new Error('QQ 官方取链失败' + (j && j.req_0 && j.req_0.msg ? '：' + j.req_0.msg : ''));
@@ -518,34 +548,51 @@
   async function getMediaSource(musicItem, quality) {
     var mid = String(musicItem.songmid || musicItem.id || '');
     var name = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
+    // 整段 9s 软上限：沙箱方法级 10s 硬超时，留 1s 余量；到点中止所有在途请求
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var signal = controller ? controller.signal : null;
+    var bestSoFar = null;   // 已通过【身份校验 + safeUrl 过滤】的次优链，供超时/全失败兜底
     var errs = [];
-    // 1) 官方 QQ 取链（vkey 构造已对齐官方；返回明文 http，不带 headers）
-    if (mid) {
-      try {
-        var official = await qqOfficialGetUrl(mid, quality);
-        // 经 safeUrl(过滤 HLS/非法链) + 实时可播放探测双闸门，确保交给播放器的必是可放音频；
-        // 即便某 CDN 节点对错误 vkey 回 HTML，也不会把崩溃性 URL 交给原生播放器。
-        var offU = safeUrl(official);
-        if (offU && await validatePlayable(offU)) return { url: offU };
-        if (offU) errs.push('QQ官方:链不可播放(已跳过)');
-      } catch (e) { errs.push('QQ官方:' + e.message); }
+    function onMatch(u) { if (u && !bestSoFar) bestSoFar = u; }
+    var deadline = controller ? setTimeout(function () { try { controller.abort(); } catch (e) {} }, 9000) : null;
+    function finish(r) { if (deadline) clearTimeout(deadline); if (controller) { try { controller.abort(); } catch (e) {} } return r; }
+    try {
+      // ① 官方 QQ 快路径（优先，包装为可能 null 的 Promise，不影响并发）
+      var offP = (mid ? qqOfficialGetUrl(mid, quality, signal) : Promise.resolve(null))
+        .then(function (official) {
+          var u = official ? safeUrl(official) : null;
+          if (!u) return null;
+          return validatePlayable(u, signal).then(function (ok) { return ok ? { url: u } : null; });
+        })
+        .catch(function () { return null; });
+      // ② 首选备用 mvmp3（并发）——与官方同时启动，不浪费时间
+      var mvP = mvGetMediaSource(musicItem, signal, onMatch)
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('mvmp3:' + (e && e.message)); return null; });
+      // ③ 次选备用 Tonzhon（并发）
+      var tzP = getNeteaseUrlForQuery((musicItem.title || '').trim(), (musicItem.artist || '').trim(), signal, musicItem, onMatch)
+        .then(function (u) { return u ? { url: u } : null; })
+        .catch(function (e) { errs.push('Tonzhon:' + (e && e.message)); return null; });
+
+      // 先等官方（最多 7s）；官方未成则进入 ②/③ 兜底
+      var off = await Promise.race([offP, new Promise(function (res) { setTimeout(res, 7000); })]);
+      if (off && off.url) return finish({ url: off.url });
+
+      // 【v0.1.2 回退修正】用户指定：兜底优先选 mvmp3（无名音乐网，按【歌手 - 歌名】严格匹配歌名+作者），
+      // 仅在 mvmp3 未取到时退而求其次用 Tonzhon（时长可校验）。②/③ 仍并发启动，不损失速度。
+      // mvmp3 已用 isGoodMatch（歌名+作者双重校验）排除“同名异人/同名异长”错曲，故优先返回其取到的正曲。
+      var mvR = await mvP;
+      if (mvR && mvR.url) return finish({ url: mvR.url }); // 首选备用 mvmp3
+      var tzR = await tzP;
+      if (tzR && tzR.url) return finish({ url: tzR.url }); // 次选备用 Tonzhon
+      // 两侧兜底皆败，但存在“已通过身份校验”的次优链（仅时长未知场景）→ 超时/失败前仍返回，最大化“有歌可播”
+      if (bestSoFar) return finish({ url: bestSoFar });
+      throw new Error('《' + name + '》官方取链失败，且备用音源（mvmp3 / Tonzhon）均未取得：' + (errs.join('；') || '未知原因') +
+        '。若 mvmp3 提示“验证失败”多为临时升级，稍后重试即可；Tonzhon 对极冷门曲也可能无匹配。');
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      if (controller) { try { controller.abort(); } catch (e) {} }
     }
-    // 2) 首选备用：无名音乐网 mvmp3（自动过人机验证）
-    try {
-      var mv = await mvGetMediaSource(musicItem);
-      var mvU = mv && mv.url ? safeUrl(mv.url) : null;
-      if (mvU && await validatePlayable(mvU)) return { url: mvU }; // 不带 Referer（否则 CDN 403）
-      if (mvU) errs.push('mvmp3:链不可播放(已跳过)');
-    } catch (e) { errs.push('mvmp3:' + e.message); }
-    // 3) 次选备用：Tonzhon 网易云匹配（tonzhon 搜索发现 + 网易云 weapi 取链）
-    try {
-      var tz = await getNeteaseUrlForQuery((musicItem.title || '').trim(), (musicItem.artist || '').trim());
-      var tzU = tz ? safeUrl(tz) : null;
-      if (tzU && await validatePlayable(tzU)) return { url: tzU };
-      if (tzU) errs.push('Tonzhon:链不可播放(已跳过)');
-    } catch (e) { errs.push('Tonzhon:' + e.message); }
-    throw new Error('《' + name + '》QQ官方取链失败，且备用音源（mvmp3 / Tonzhon）均未取得：' + (errs.join('；') || '未知原因') +
-      '。若 mvmp3 提示“验证失败”多为临时升级，稍后重试即可；Tonzhon 对极冷门曲也可能无匹配。');
   }
 
   // ---------- 歌词 ----------
@@ -590,7 +637,7 @@
         id: String(t.id),
         title: t.topTitle || t.name || t.title || ('榜单' + t.id),
         description: t.description || t.intro || '',
-        coverImg: fixImg(t.picUrl || t.pic),
+        artwork: fixImg(t.picUrl || t.pic), // 【v0.1.0 修复】协议字段为 artwork（非 coverImg），否则排行榜封面不渲染
         playCount: t.listenCount || t.listennum,
       };
     });
@@ -701,13 +748,25 @@
     };
   }
 
+  // ===================== mvmp3 Cookie 后台预热（【v0.1.0】） =====================
+  // 在插件加载后延迟预热 + 周期续期（< 50min TTL），并随 search 调用顺手预热；
+  // 播放时 ensureMvCookie 命中热缓存，不再同步等 9s 人机验证。
+  function warmMvCookie() { ensureMvCookie(false).catch(function () {}); }
+  if (typeof setTimeout === 'function') {
+    setTimeout(warmMvCookie, 4000);
+    if (typeof setInterval === 'function') setInterval(warmMvCookie, 40 * 60 * 1000);
+  }
+
   module.exports = {
     platform: 'QQ音乐',
-  version: '0.0.8',
+  version: '0.1.2',
   author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
-      '播放取链三层兜底：①官方QQ(CgiGetVkey，需登录Cookie解锁) → ②首选备用 无名音乐网mvmp3(自动过人机验证) → ③次选备用 Tonzhon网易云匹配(tonzhon.com搜索+weapi取链，覆盖QQ的VIP/试听失效曲)。',
+      '播放取链【v0.1.2 竞速并发+mvmp3 优先】：①官方QQ(CgiGetVkey，需登录Cookie解锁) 优先(≤7s)，' +
+      '②首选备用 无名音乐网mvmp3(后台预热Cookie+自动过人机验证+【歌手-歌名】严格身份校验) 与 ③次选备用 Tonzhon网易云匹配(tonzhon.com搜索+weapi取链) 并发启动；' +
+      '兜底优先选 mvmp3（用户指定源，按【歌手 - 歌名】严格匹配歌名+作者，排除“王大毛-去年夏天”类同名异人错曲），mvmp3 未取到时再退 Tonzhon；' +
+      '整段 9s 软上限 + 歌名/作者/时长多重身份校验，最大化“有歌可播”且规避沙箱 10s 超时。',
     srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
@@ -720,7 +779,7 @@
       {
         key: 'mvmp3_cookie',
         name: 'mvmp3 Cookie（可选）',
-        hint: '无名音乐网(mvmp3)的人机验证由插件自动完成，无需你手动操作；会话约 50 分钟自动刷新一次。若自动过验证偶发失败，可在此填 mvmp3 的 PHPSESSID（站点 https://www.mvmp3.com 登录/F12 取 Cookie）以跳过自动验证。',
+        hint: '无名音乐网(mvmp3)的人机验证由插件自动完成并后台预热，无需你手动操作；会话约 50 分钟自动续期一次。若自动过验证偶发失败，可在此填 mvmp3 的 PHPSESSID（站点 https://www.mvmp3.com 登录/F12 取 Cookie）以跳过自动验证。',
       },
     ],
     hints: {
@@ -741,5 +800,18 @@
     importMusicSheet: importMusicSheet,
     getMusicSheetInfo: getMusicSheetInfo,
     getRecommendSheetDetail: getMusicSheetInfo, // 别名：部分版本 MusicFree 用此名拉取推荐/热门歌单详情
+    // _internal：仅供单元测试访问纯函数（isGoodMatch/多重身份校验、safeUrl、JSONP 剥离、base64 解码等）
+    _internal: {
+      isGoodMatch: isGoodMatch,
+      matchScore: matchScore,
+      norm: norm,
+      durMatch: durMatch,
+      mvParseItems: mvParseItems,
+      safeUrl: safeUrl,
+      stripJsonp: stripJsonp,
+      b64Decode: b64Decode,
+      toArtworkFromAlbumMid: toArtworkFromAlbumMid,
+      fixImg: fixImg,
+    },
   };
 })();
