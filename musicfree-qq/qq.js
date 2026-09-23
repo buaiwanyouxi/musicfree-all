@@ -1,5 +1,5 @@
 // QQ音乐（腾讯系）音源插件
-// 平台：QQ音乐  author：tianpeng  version：0.0.1
+// 平台：QQ音乐  author：tianpeng  version：0.1.6
 //
 // 接口契约（经运行时真实联网探测 + 研读 jsososo/QQMusicApi 开源实现得出，全部免签端点）：
 //   搜索        GET  c.y.qq.com/soso/fcgi-bin/client_search_cp?aggr=1&cr=1&flag_qc=0&p=<page>&n=30&w=<kw>&format=json
@@ -12,15 +12,114 @@
 //   歌单分类    GET  c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_tag_conf.fcg?format=json&inCharset=utf8&outCharset=utf-8
 //   取链        GET  u.y.qq.com/cgi-bin/musicu.fcg?-=getplaysongvkey&...&data={vkey.GetVkeyServer.CgiGetVkey}  (免签，但 purl 需登录态 authst cookie，未登录返回空)
 //
-// 播放取链三层兜底（参考本仓库 wy.js / kugou_mvmp3.js / xiage.js）：
-//   ① 官方 QQ CgiGetVkey（需登录 Cookie；免费曲返回完整链，VIP/试听曲官方不给链）
-//   ② 首选备用：无名音乐网 mvmp3.com（自动过人机验证，独立跨源库）
-//   ③ 次选备用：Tonzhon 网易云匹配（tonzhon.com 按歌名搜到网易云同名曲，纯 JS weapi 取链；不依赖 QQ 登录态，对 QQ 的 VIP/试听曲有效）
-// 官方取链失败时不再直接抛错，而是依次尝试 ② ③，最大化“有歌可播”。
+// ============ 取链「竞速并发」而非「顺序」（v0.1.0 定型，v0.1.3 换源，v0.1.6 提速+扩源） ============
+//   ① 官方 QQ CgiGetVkey 作为【优先快路径】（v0.1.6 起最多等 3s，原 7s）；
+//   ②③④ AAX音乐网 aax.cx ／ 无名音乐网 mvmp3 ／ 无忧音乐网 qeecc.com（酷我系 HTML 站点）
+//   ⑤⑥⑦ 音乐搜索神器 ／ GD音乐台 ／ MyFreeMP3（聚合 API 型，v0.1.6 新增）
+//      七源与官方【并发】启动；v0.1.6 起由「串行 await 定序」升级为【首出即用竞速】，
+//      并按验收顺序分层（高优先组 ⑤⑥⑦ 独占 BK_TIER_MS 窗口）→ 总耗时≈单层 worst-case 而非各层之和。
+//   - 整段 9s AbortController 软上限：超时即中止在途请求，返回「已通过身份校验的最佳链」而非干等全失败。
+//   - mvmp3 登录态 Cookie 在插件加载 / 搜索时【后台预热】并周期续期；aax.cx / qeecc.com 与 mvmp3 同源 CMS，
+//     其人机验证由 siteAutoVerify 在首次取源时自动完成并缓存 50 分钟，播放时不再同步等人机验证。
+//   - 备用源匹配升级为【歌名 + 作者 + 时长】多重身份校验（isGoodMatch），避免错播（aax 条目自带时长，可全量校验）。
+//   - 移除昂贵的「试听片段嗅探」(looksLikePreview, 5s×N)，以身份校验替代安全网，显著降延迟。
+// ============ v0.1.4：歌词三级兜底（修复「备用源播放时无歌词」） ============
+//   缺陷根因：取链有四层兜底，歌词却只有 QQ 官方一条路 → 凡"靠备用源才播得出"的曲（跨源歌单/收藏、
+//   外源 id、无 songmid）必然无歌词（实测跨源曲 100% 复现）。且官方无版权曲返回 retcode=-1901 空歌词时
+//   原实现不报错、直接返回空串，进一步掩盖问题。
+//   现改为三级链：①QQ 官方（songmid 形态校验 + lrcLooksValid 有效性校验，空/占位则下探）
+//              → ②取链时顺带缓存的该源歌词（零额外请求，与【实际播放的音源】同源同轴）
+//              → ③按【歌名+歌手】在 mvmp3 / aax 并发反查（复用 isGoodMatch 防张冠李戴，8s 软上限）。
+//   配套：过滤站点占位歌词（aax 的「暂无歌词内容」）与水印行（mvmp3 的「无名音乐网 www.mvmp3.com」）。
+//   附带修复一：非 QQ songmid 不再盲试官方取链（跨源曲取链 6893ms → ~2s）。
+//   附带修复二：aax / qeecc 的会话也纳入后台预热（原仅预热 mvmp3），歌词冷路径由 2—7s 降至 2.2—3.6s。
+// ============ v0.1.6：取链提速（第一批·超时治理 + 并行竞速） ============
+//   目标：官方正常 <1s；官方超时后备源 <3s（原最坏 7—9s）。
+//   ① 官方抢跑窗口 7000ms → 3000ms：官方 3s 内不出链即让位备用源，不再干等（OFFICIAL_GRACE_MS）。
+//      官方 CgiGetVkey 单请求超时 8000ms → 3000ms（OFFICIAL_TIMEOUT）。
+//   ② 备用源由「串行 await 定序」改为【首出即用】竞速（raceFirstUrl）：
+//      三源仍在 t=0 并发启动，到达竞速点时多半已就绪 → 直接取第一个出链者，总耗时≈官方窗口(3s)。
+//      保留 aax → mvmp3 → qeecc 的【软优先】：靠前者在 BK_PREFER_MS(300ms) 窗口内出链则优先。
+//   ③ 统一超时治理：备用源（mvmp3/aax/qeecc）单请求 9000ms → 3000ms（SRC_TIMEOUT）；
+//      可播放性探测 7000ms → 3000ms（VALIDATE_TIMEOUT）；歌词 lrc 拉取 8000ms → 3000ms。
+//   ④ 修正 srcUrl：原指向不存在的幽灵仓库 buaiwanyouxi/musicfreemusicfree-all（GitHub 404，
+//      仅靠 jsdelivr 历史冻结缓存续命）→ 改指真实发布仓库 buaiwanyouxi/musicfree-all。
+// ============ v0.1.6 第二批：播放链缓存 + 预取（重复播放 0ms） ============
+//   ① URL 内存缓存：key = id + quality（分音质分槽，避免串音质），TTL 5 分钟（QQ 链接有时效），
+//      LRU 上限 100 条。命中即 0ms 返回，不走任何网络。
+//   ② 列表预取：search / getMusicSheetInfo 返回后，顺带预热【前 3 首】的播放链
+//      （fire-and-forget、错峰 250ms 启动、失败静默、命中缓存则跳过），使"搜完就点第一首"首播 0ms。
+// ============ v0.1.6 第三批：备用源检索「全名 / 剥离注解」双查 + 身份校验增强 ============
+//   ① 双查询竞速（dualTitleSearch）：原文案仅剥离括号注解（「阴天（Live）」→「阴天」）会丢版本区分度，
+//      现改为【全名（含括号注解）】与【剥离注解】两路并发。语义＝「谁先返回【有效】结果用谁」：
+//      某路先回且**其中已含通过身份校验的候选** → 立即采用该路；某路先回但无有效候选 → 继续等另一路，
+//      两路都到则取【并集】（去重，全名路在前）。真机实测：mvmp3 为模糊排序，全名路 top1 正确率仅 1/6、
+//      剥离路 3/6，单取一路会丢正确候选；并集把「池中含正确候选」由 5/6 提升到 6/6。
+//      另实测：同一站点并发双查会互相限流（6 例中 5 例剥离路 >800ms 才回），故等待窗口 DUAL_TRUST_HOLD_MS=3500ms。
+//   ② 作者匹配增强（artistMatch）：整体互含失败后，按 /、,，&;；|+ feat. ft. 切分做单歌手互含，
+//      兼容「周杰伦/费玉清」「A & B」「A feat. B」多歌手标注（单歌手片段须 ≥2 字符）。
+//   ③ 时长容差 3s → 5s（站点 playtime 按整秒取整、片头片尾差异可达数秒，3s 过严会误杀正确候选）。
+//   ④ matchScore 与 isGoodMatch 口径对齐，并给「歌名完全相等」额外加分，压制长尾包含候选。
+//   ⑤ 【修复 P1】mvParseItems 改按真实页面结构解析：歌手取自 <a class="url"> 锚文本、时长取自
+//      <span class="stime">MM:SS</span>。原实现只取 <img alt>，而线上 alt 只有歌名 →
+//      artist 恒为空、duration 恒缺，三重校验退化为「仅歌名」（真机实测 30/30 条无作者无时长）。
+//      修复后真机 30/30 条均带 artist + duration，「晴天」从 30 条候选中精确筛出 3 条（top1 即周杰伦原唱）。
+// ============ v0.1.6 第四~六批：新增三个聚合 API 型备用源 ============
+//   验收顺序（船长指定）：官方 → ⑤音乐搜索神器 → ⑥GD音乐台 → ⑦MyFreeMP3 → ②aax → ③mvmp3 → ④qeecc。
+//   三源均为「单端点 + 查询参数 → JSON」，无人机验证、免登录，故共用适配器 apiSourceGetMediaSource：
+//     检索（先全名、剥离名兜底 dualTitleSearchSeq）→ isGoodMatch 身份校验精筛 → matchScore 排序
+//     → 逐候选取链（上限 API_CANDIDATES）→ validatePlayable 可播性探测。
+//   竞速升级为【分层竞速 raceTiered】：高优先组（⑤⑥⑦）在 BK_TIER_MS 窗口内独占出线权，
+//     窗口结束或被全部否决后全 6 源「首出即用」，兼顾验收顺序与低延迟（不被慢源拖满超时）。
+//   ⑤ 音乐搜索神器 music.lmb520.cn（实抓）：POST / form: input&filter=name|id&type=<平台>&page=1
+//      → {code:200,data:[{type,link,songid,title,author,lrc,url,pic}]}。
+//      实测：netease/kuwo/kugou 可搜可取链；**type=qq 可搜但取链 403**（站点不支持该平台取链）；
+//      type=tencent 直接 403。故仅并发可取链的三个平台，id 编码 <plat>:<songid>。
+//   ⑥ GD音乐台 music-api.gdstudio.xyz（实抓）：GET api.php?btwaf=99801110&types=search|url|lyric&...
+//      search → [{id,name,artist[],album,pic_id,url_id,lyric_id}]（不舍时长）；url → {url,br,size}。
+//      实测 source 白名单极窄：**仅 netease / joox 可用**，tencent/kuwo/kugou/migu/spotify 等一律 400。
+//      br 映射 128/192/320/740(flac)/999(hires)，空链自动降级 320 → 128。
+//   ⑦ MyFreeMP3（实抓纠正）：船长所给 `api.liumingye.cn` **已下线**（HTTP 522，music.liumingye.cn 亦
+//      改版为「全盘搜」）。mp3.zaodoc.com 前台可用，其 main.js 暴露真实接口＝ www.puduoduo.top 的
+//      Z-Blog kk_music 插件：act=searchmusic&word&limit → data.songs[{id,name,artists,duration(毫秒)}]；
+//      act=musicurl&id&quality=standard|320|flac|lossless → data.url（无该音质时为空串，自动降级 standard）。
+//      实测免 Cookie 可用，且 duration 可直接用于时长校验。
+// ============ v0.1.6 第七批：备用源健康度自适应排序（软熔断） ============
+//   问题：任一家第三方站点都可能临时升级/限流/改版（实测 aax 会话偶发验证、GD 白名单收窄）。
+//     坏源虽因竞速不致拖满超时，却会白占 BK_TIER_MS 独占窗口，把本该由健康源承担的出线权浪费掉。
+//   做法：进程内为每个备用源记「连续失败数」（bkMark）；**连续失败 ≥ BK_FAIL_THRESHOLD(3)** 才在本轮
+//     组内临时降权（bkOrderGroup 稳定排序沉到该组末位），**成功一次立即复位**；健康时组内次序与
+//     船长指定的验收顺序逐位一致（首轮无历史 → 全 0 分 → 原序）。
+//   边界：health 仅作用于「同一优先组内部」的软优先次序，不跨组、不增删源、不改超时；故障源仍参与
+//     竞速（只是出线权靠后），故一旦站点恢复即自动上位，不存在永久拉黑。
+//   配套修复一（真机暴露的误判）：出线源确定后 finish() 会 abort 在途请求，未出线源因此抛 AbortError，
+//     原实现把它当「源故障」记账——真机实测「一次成功取链就让 3 个健康源各记 fail=1」，连续几次即被
+//     错误降权。现改为：凡 signal 已被我方 abort（或错误名/信息含 abort）者一律【中性跳过】，不加不减。
+//   配套修复二（消除确定空等）：高优先组已「全军落空」（组内全部已定且无一出链）时立即解禁低优先组，
+//     不再空等满 BK_TIER_MS；单测实测 1200ms 窗口下出线耗时 1200ms → 207ms，顺序语义不变。
+//   实测特性（如实记录，勿误判为缺陷）：⑤ 音乐搜索神器的检索本身需 1.5—1.8s，已超过 BK_TIER_MS(1200ms)
+//     独占窗口，故真机上通常由 ⑥ GD音乐台 在窗口边界（约 1.2s）出线——这是「保住船长指定验收顺序」的
+//     必然代价；如更看重延迟，可下调 BK_TIER_MS，如更看重 ⑤ 优先，可上调它。
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
-  var cheerio = reqFn('cheerio'); // mvmp3 搜索页解析（沙箱内置；若不可用，mvmp3 兜底会安全失败转下一层）
+  // 无名音乐网(mvmp3) 搜索结果解析采用「纯正则」实现，不依赖 cheerio —— 移动端沙箱不注入 cheerio，
+  // 若用 cheerio.load 解析则移动端兜底音源完全失效（解析返回空 → 取链失败 → 非免费曲在歌单/排行榜连续
+  // 播放时易触发崩溃）。纯正则解析在桌面端/移动端一致可用，故彻底移除 cheerio 依赖。
+
+  // Promise.any 兜底（部分移动端 JS 引擎未内置）：首个 fulfilled 即胜，全 reject 则 reject 聚合错误
+  if (typeof Promise.any !== 'function') {
+    Promise.any = function (proms) {
+      var ps = Array.prototype.slice.call(proms);
+      if (!ps.length) return Promise.reject(new Error('empty'));
+      return new Promise(function (resolve, reject) {
+        var errs = [], done = 0;
+        ps.forEach(function (p, i) {
+          Promise.resolve(p).then(resolve, function (e) { errs[i] = e; if (++done === ps.length) reject(errs); });
+        });
+      });
+    };
+  }
 
   // ---------- 端点 ----------
   var HOST = 'https://c.y.qq.com';
@@ -36,6 +135,25 @@
 
   var CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
   var REFERER = 'https://y.qq.com/';
+
+  // ---------- 超时与竞速参数（【v0.1.6 第一批】统一超时治理） ----------
+  // 目标：官方正常 <1s；官方超时后备源 <3s。做法＝官方只给 3s 抢跑窗口，备用源【首出即用】竞速。
+  var OFFICIAL_TIMEOUT = 3000;   // 官方 CgiGetVkey 单请求超时（原 8000）
+  var OFFICIAL_GRACE_MS = 3000;  // 官方快路径最长等待，超时即让位备用源（原 7000）
+  var SRC_TIMEOUT = 3000;        // 备用源（mvmp3/aax/qeecc）单请求超时（原 9000）
+  var VALIDATE_TIMEOUT = 3000;   // 播放链可播放性探测超时（原 7000）
+  var BK_PREFER_MS = 300;        // 备用源优先窗口：靠前者在此窗口后仍无果，则取最快出链者
+  // 【v0.1.6 第四~六批】新增三个聚合 API 备用源后的竞速参数
+  var BK_TIER_MS = 1200;         // 高优先备用源（音乐搜索神器/GD音乐台/MyFreeMP3）独占窗口，之后全组首出即用
+  var API_CANDIDATES = 2;        // 聚合 API 型源逐候选试链的条数上限（控请求数与延迟）
+  // 【v0.1.6 第七批】备用源健康度自适应排序参数
+  // 设计约束：**不改变船长指定的验收顺序**——全部健康时顺序与既有完全一致；
+  // 仅当某源连续失败达阈值时，才在「本轮组内」临时降权（沉到该组末位），成功一次立即复位。
+  var BK_FAIL_THRESHOLD = 3;     // 连续失败达此数 → 组内临时降权（circuit-breaker 软熔断，非永久拉黑）
+  // 【v0.1.6 第三批】备用源检索「全名 / 剥离注解」双查询参数
+  // 等待窗口须显著大于单请求耗时：真机实测同一站点并发双查会互相限流，剥离路常 >800ms 才回；
+  // 该窗口仅在「先回的那一路没有可信候选」时生效（有可信候选则立即返回，不等待）。
+  var DUAL_TRUST_HOLD_MS = 3500;
 
   // ---------- 工具 ----------
   function toObj(d) {
@@ -65,7 +183,7 @@
     return {};
   }
   function fixImg(u) {
-    if (!u) return '';
+    if (!u) return undefined; // 空串 → undefined：避免原生图片组件拿到空 URI 触发崩溃
     u = String(u).trim();
     if (u.indexOf('http') === 0) return u;
     if (u.indexOf('//') === 0) return 'https:' + u;
@@ -92,6 +210,7 @@
       validateStatus: function () { return true; },
     };
     if (opts.params) config.params = opts.params;
+    if (opts.signal) config.signal = opts.signal; // 透传 AbortController 信号，支持整段软上限中止
     var r = await axios.get(url, config);
     var raw = r.data;
     if (typeof raw === 'string') raw = stripJsonp(raw);
@@ -135,10 +254,19 @@
     return typeof s === 'string' && s.length > 24 && /^[A-Za-z0-9+/=\r\n]+$/.test(s.replace(/\s/g, ''));
   }
 
+  // 由 albummid 合成真实封面 URL（与官方 maotoumao/MusicFreePlugins qq.js 一致：
+  // https://y.gtimg.cn/music/photo_new/T002R300x300M000<albummid>.jpg）。无 albummid 时返回
+  // undefined（绝不返回空串 ''）——空串 artwork 会被原生图片组件 / 锁屏 MediaSession 当成空 URI，
+  // 在移动端引发「无日志、直接闪退」的原生层崩溃。这是前面 6 次修复（仅改 getMediaSource 取链逻辑）
+  // 全部漏掉、且每次都复现的真正结构性根因。
+  function toArtworkFromAlbumMid(albummid) {
+    if (!albummid) return undefined;
+    return 'https://y.gtimg.cn/music/photo_new/T002R300x300M000' + String(albummid) + '.jpg';
+  }
   // 统一音乐条目映射（搜索/歌单详情/榜单详情 字段略有差异）
   function toTrack(it) {
     if (!it) return null;
-    // 搜索：it = {songmid, songid, songname, singer:[{name}], albumname, interval}
+    // 搜索：it = {songmid, songid, songname, singer:[{name}], albumname, albummid, interval}
     // 歌单详情：it = {songmid, songid, songname, singer:[{name}], albumname, albummid, interval, strMediaMid}
     // 榜单详情：it = {data:{songmid, songname, singer, albumname, albummid, interval, strMediaMid}}
     var src = it.data ? it.data : it;
@@ -146,14 +274,17 @@
     var title = src.songname || src.title || src.name || '';
     var artist = joinArtists(src.singer);
     var album = src.albumname || src.album || '';
+    var albummid = src.albummid || (src.album && src.album.mid) || '';
     var dur = src.interval;
     if (dur && dur < 1000) dur = dur * 1000;
     return {
       id: String(mid || src.songid || ''),
+      songmid: String(mid || ''),
       title: title,
       artist: artist,
       album: album,
-      artwork: '',
+      albummid: albummid,                                          // 透传，供详情/原生层按需取封面
+      artwork: toArtworkFromAlbumMid(albummid),                    // 有专辑则真实封面 URL，否则 undefined（绝不空串）
       duration: dur,
     };
   }
@@ -161,12 +292,14 @@
   // ---------- 搜索 ----------
   async function search(query, page, type) {
     if (type && type !== 'music') return { isEnd: true, data: [] };
+    warmAllCookies(); // 搜索即预热三源会话（mvmp3/aax/qeecc）：用户点歌前通常先经过搜索，播放与取歌词时会话多半已热
     var r = await req(SEARCH_API, {
       params: { aggr: 1, cr: 1, flag_qc: 0, p: Math.max(1, page || 1), n: 30, w: query, format: 'json' },
     });
     var d = toObj(r);
     var list = (d.data && d.data.song && d.data.song.list) || [];
     var data = list.map(toTrack).filter(Boolean);
+    prefetchTopTracks(data, 'standard'); // 【v0.1.6 第二批】列表就绪即预取前 3 首播放链（fire-and-forget，不 await、不阻塞返回）
     return { isEnd: list.length < 30, data: data };
   }
 
@@ -188,8 +321,8 @@
     if (raw.indexOf('=') === -1) return 'PHPSESSID=' + raw;
     return raw;
   }
-  async function autoVerify() {
-    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: 9000 });
+  async function autoVerify(signal) {
+    var r1 = await axios.get(MV_BASE + '/', { headers: MV_HEADERS, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; } });
     var setCk = (r1.headers && r1.headers['set-cookie']) || [];
     var jar = {};
     setCk.forEach(function (c) {
@@ -203,55 +336,201 @@
     var csrf = m ? m[1] : '';
     await axios.post(MV_BASE + '/', 'csrf_token=' + encodeURIComponent(csrf) + '&human_check=on', {
       headers: { ...MV_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded', Referer: MV_BASE + '/', Cookie: ck },
-      timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; },
+      timeout: SRC_TIMEOUT, maxRedirects: 5, signal: signal, validateStatus: function () { return true; },
     });
     return ck;
   }
-  async function ensureMvCookie(forceAuto) {
+  async function ensureMvCookie(forceAuto, signal) {
     var now = Date.now();
     if (!forceAuto && _mvCookie && (now - _mvCookieAt) < MV_COOKIE_TTL) return _mvCookie;
     var userCk = normCookie(getVars().mvmp3_cookie);
     if (userCk && !forceAuto) { _mvCookie = userCk; _mvCookieAt = now; _mvCookieUser = true; return _mvCookie; }
-    var fresh = await autoVerify();
+    var fresh = await autoVerify(signal);
     _mvCookie = fresh; _mvCookieAt = now; _mvCookieUser = false; return _mvCookie;
   }
   function mvIsVerify(html) { return /安全人机验证|我不是人机|verifyForm/.test(html || ''); }
+  // 【实体解码】mvmp3 的歌手/歌名走 HTML 文本节点，需还原常见实体（与 aax 的 title 属性不同）
+  function decodeEntities(s) {
+    return String(s || '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'");
+  }
+  // 纯正则解析，不依赖 cheerio（移动端沙箱缺 cheerio 时也能解析，这是移动端首选备用音源可用的关键）。
+  // 【v0.1.6 第三批 修复 P1】原实现只取 <img alt="…">，实测 mvmp3 的 alt **只有歌名、无歌手**，
+  //   且时长藏在 <span class="stime">04:02</span> —— 导致解析结果 artist 恒为空、duration 恒缺，
+  //   三重身份校验（歌名+作者+时长）退化为「仅歌名」，同名异人/异版本错播风险显著上升。
+  //   现改为按 <li> 结果块解析，从真实位置取样：
+  //     · id        ← /mp3/<32hex>.html
+  //     · 歌手/歌名  ← <a class="url">莫文蔚 - <font color='red'>阴天</font></a>（去标签后按 ' - ' 拆）
+  //     · 时长      ← <span class="stime">04:02</span>（无则回退 playtime）
+  //   回退链：class="url" 锚文本 → img alt（保持对旧版页面的兼容）。
   function mvParseItems(html) {
-    if (!cheerio || !cheerio.load) return [];
-    var $ = cheerio.load(html);
+    if (!html || typeof html !== 'string') return [];
+    // 只解析结果列表区（<div class="play_list"> 之后），避免把侧栏「推荐/最新」条目混入候选
+    var seg = html, pl = html.indexOf('play_list');
+    if (pl >= 0) seg = html.slice(pl);
     var items = [], seen = {};
-    $('.play_list li').each(function (i, el) {
-      var a = $(el).find('a.url').first();
-      if (!a.length) return;
-      var href = a.attr('href') || '';
-      var m = href.match(/\/mp3\/([a-f0-9]{32})\.html/i);
-      if (!m) return;
-      var id = m[1];
-      if (seen[id]) return;
+    var re = /<li>([\s\S]*?)<\/li>/gi;
+    var m;
+    while ((m = re.exec(seg))) {
+      var blk = m[1];
+      var im = blk.match(/\/mp3\/([a-f0-9]{32})\.html/i);
+      if (!im) continue;                                  // 非结果块（导航/推荐等）跳过
+      var id = im[1];
+      if (seen[id]) continue;
       seen[id] = 1;
-      var ta = (a.text() || '').replace(/\s+/g, ' ').trim();
-      var artist = '', title = ta;
-      var idx = ta.indexOf(' - ');
-      if (idx > 0) { artist = ta.substring(0, idx).trim(); title = ta.substring(idx + 3).trim(); }
-      items.push({ id: id, title: title, artist: artist });
-    });
+      // ① 歌手 + 歌名：优先 class="url" 锚文本（站点写入的「歌手 - 歌名」），回退 img alt
+      var raw = '';
+      var nm = blk.match(/<a[^>]*class="url"[^>]*>([\s\S]*?)<\/a>/i);
+      if (nm) raw = decodeEntities(nm[1].replace(/<[^>]+>/g, ''));   // 去 <font> 等内联标签
+      if (!raw) { var am = blk.match(/alt="([^"]*)"/i); raw = decodeEntities(am ? am[1] : ''); }
+      raw = String(raw).replace(/\s+/g, ' ').trim();
+      var title = raw, artist = '';
+      var idx = raw.indexOf(' - ');
+      if (idx > 0) { artist = raw.substring(0, idx).trim(); title = raw.substring(idx + 3).trim(); }
+      // 清洗首尾【】/[]（mvmp3 常包裹为【歌手 - 歌名】），确保歌手/歌名干净
+      artist = artist.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+      title = title.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+      if (!title) continue;
+      // ② 时长：<span class="stime">MM:SS</span>（与 aax 的 playtime 同构）
+      var td = blk.match(/class="(?:stime|playtime)"[^>]*>\s*(\d{1,2}):(\d{2})/i);
+      var duration = td ? (parseInt(td[1], 10) * 60 + parseInt(td[2], 10)) * 1000 : undefined;
+      items.push({ id: id, title: title, artist: artist, duration: duration });
+    }
     return items;
   }
   function norm(s) {
     return (s || '').toLowerCase().replace(/\s+/g, '').replace(/[()（）【】\[\]《》、，。,.]/g, '');
   }
-  function mvRank(cands, musicItem) {
-    var t = norm(musicItem.title), ar = norm(musicItem.artist);
-    var scored = cands.map(function (c) {
-      var ct = norm(c.title), ca = norm(c.artist), s = 0;
-      if (t && (ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0)) s += 2;
-      if (ar && ca && (ca.indexOf(ar) >= 0 || ar.indexOf(ca) >= 0)) s += 1;
-      return { c: c, s: s };
-    }).filter(function (x) { return x.s > 0; });
-    scored.sort(function (a, b) { return b.s - a.s; });
-    return scored.map(function (x) { return x.c; });
+  // 备用音源检索关键词归一化（【备用音源检索优化】）：
+  // 官方 QQ 无版权 / 取链失败时回退到 aax / mvmp3 / qeecc 三备用源；这些站点多以「纯净歌名」建索引，
+  // 而 QQ 返回的歌名常带括号注解（如「阴天（Live）」「晴天（Remix）」「晚安（和声版）」），
+  // 直查会因注解噪声而漏检。故回退检索前剥离歌名中括号内容（（）/()/【】/[]），仅保留主体歌名，作者保持不变。
+  // 仅作用于「备用音源检索关键词」，不影响官方 QQ 检索、in-app 搜索框与歌词反查（后者有独立用途，不在此优化内）。
+  function stripBracketed(s) {
+    return (s || '')
+      .replace(/[（(【\[][^）)\]】]*[）)\]】]/g, '')   // 去掉括号及其中注解内容
+      .replace(/\s+/g, ' ')
+      .trim();
   }
-  async function mvPlayUrl(hash, cookie) {
+  function backupQueryTitle(musicItem) {
+    var t = stripBracketed(musicItem.title);
+    return t || (musicItem.artist || '').trim();
+  }
+  // 【v0.1.6 第三批】作者匹配增强：先做整体互含（兼容「周杰伦」⊂「周杰伦/费玉清」这类站点写法），
+  // 互含均不成立时，再退化到「按分隔符切分后的单歌手互含」，兼容「A、B」「A & B」「A feat. B」多歌手标注。
+  // 单歌手片段须 ≥2 字符才参与包含判定，避免单字噪声（如 "J"）误命中。
+  function artistMatch(ar, ca) {
+    if (!ar || !ca) return true;                       // 任一侧缺失 → 不据此否决
+    if (ca.indexOf(ar) >= 0 || ar.indexOf(ca) >= 0) return true;
+    function tokens(s) {
+      return String(s).split(/[\/、,，&;；|+]+|\s*feat\.?\s*|\s*ft\.?\s*/i)
+        .map(function (x) { return norm(x); })
+        .filter(function (x) { return x && x.length >= 2; });
+    }
+    var A = tokens(ar), B = tokens(ca);
+    for (var i = 0; i < A.length; i++) {
+      for (var j = 0; j < B.length; j++) {
+        if (A[i].indexOf(B[j]) >= 0 || B[j].indexOf(A[i]) >= 0) return true;
+      }
+    }
+    return false;
+  }
+  // 【v0.1.6 第三批】「全名（含括号注解）／剥离注解」双查询竞速。
+  // 背景：v0.1.5 起备用源检索统一剥离歌名括号注解（「阴天（Live）」→「阴天」），漏检率下降，
+  //       但把「同名不同版本」的区分度也丢了（站点若按全名建索引反而查不到）。
+  // 做法：两路【并发】——① 全名（含注解，版本置信度最高）② 剥离注解（兜底召回）。
+  //   · 某路先回且其中【已含通过身份校验（歌名+作者+时长）的候选】→ 立即采用该路（"谁先返回有效结果用谁"）。
+  //   · 某路先回但【无】可信候选 → 不急着定：继续等另一路，两路都到后取【并集】（去重，全名路在前）。
+  //     依据：真机实测 mvmp3 为模糊排序，全名路 top1 正确率仅 1/6、剥离路 3/6，单取一路会丢正确候选；
+  //     并集实测把「池中含正确候选」由 5/6 提升到 6/6（「匆匆那年（电影《匆匆那年》主题曲）」正是靠并集补到）。
+  //   · 兜底计时 DUAL_TRUST_HOLD_MS：等待另一路的上限，到点即用现有池（防某路既不 resolve 也不被 abort）。
+  //     真机另发现：同一站点并发双查会互相限流（6 例中 5 例剥离路在 800ms 内未回），故该窗口须显著大于单请求耗时。
+  //   · 两路皆空 → 返回空并带上首个异常原因（保留"验证失败"等可诊断信息）。
+  //   · 歌名无括号（两路等价）→ 退化为单次查询，省一次往返。
+  // kw 语义：报告「首选检索词」＝全名路有结果则全名，否则剥离名（仅用于错误提示）。
+  function dualTitleSearch(searchFn, musicItem, signal) {
+    var full = String((musicItem && musicItem.title) || '').trim();
+    var stripped = stripBracketed(full);
+    if (!full) return Promise.resolve({ items: [], kw: '', error: null });
+    if (!stripped || stripped === full) {
+      return Promise.resolve()
+        .then(function () { return searchFn(full, signal); })
+        .then(function (r) { return { items: r || [], kw: full, error: null }; },
+              function (e) { return { items: [], kw: full, error: e || null }; });
+    }
+    return new Promise(function (resolve) {
+      var st = { full: undefined, strip: undefined }, errs = [], done = false, hold = null;
+      function merge() {   // 并集去重（全名路在前：延续"全名优先"的采纳次序）
+        var out = [], seen = {};
+        [st.full || [], st.strip || []].forEach(function (arr) {
+          arr.forEach(function (it) {
+            var k = String((it && it.id) || '') + '|' + String((it && it.title) || '');
+            if (seen[k]) return;
+            seen[k] = 1; out.push(it);
+          });
+        });
+        return out;
+      }
+      function trustworthy(items) {   // 路内是否已有「通过完整身份校验」的候选
+        for (var i = 0; i < (items || []).length; i++) { if (isGoodMatch(items[i], musicItem)) return true; }
+        return false;
+      }
+      function preferKw() { return (st.full && st.full.length) ? full : ((st.strip && st.strip.length) ? stripped : full); }
+      function finish(items, kw, error) { if (done) return; done = true; if (hold) clearTimeout(hold); resolve({ items: items, kw: kw, error: error || null }); }
+      function settle(tag, items, err) {
+        if (err) errs.push(err);
+        st[tag] = items || [];
+        if (done) return;
+        // ① 本路已有「有效结果」（通过身份校验的候选）→ 立即采用，不再等另一路（速度优先）
+        if (st[tag].length && trustworthy(st[tag])) return finish(st[tag], (tag === 'full') ? full : stripped, null);
+        var other = (tag === 'full') ? st.strip : st.full;
+        // ② 另一路也已到 → 取并集（正确性优先）
+        if (other !== undefined) {
+          var u = merge();
+          return finish(u, preferKw(), u.length ? null : (errs[0] || null));
+        }
+        // ③ 本路无非可信候选且另一路未到 → 继续等（上限 DUAL_TRUST_HOLD_MS）
+        if (st[tag].length && !hold) {
+          hold = setTimeout(function () { if (done) return; finish(merge(), preferKw(), null); }, DUAL_TRUST_HOLD_MS);
+        }
+      }
+      function run(tag, kw) {
+        Promise.resolve().then(function () { return searchFn(kw, signal); })
+          .then(function (r) { settle(tag, r, null); }, function (e) { settle(tag, [], e); });
+      }
+      run('full', full);
+      run('strip', stripped);
+    });
+  }
+  // 时长一致性校验：两端都有时长且单位化为秒后，容差 3s 即视为同一曲
+  function durMatch(a, b, tol) {
+    if (!a || !b) return true; // 任一侧缺失 → 不据此否决
+    var sa = a >= 1000 ? a / 1000 : a;
+    var sb = b >= 1000 ? b / 1000 : b;
+    return Math.abs(sa - sb) <= (tol || 3);
+  }
+  // 【v0.1.0 多重身份校验】歌名 + 作者 + 时长（时长可选），三者通过才算同一首，避免错播
+  // 【v0.1.6 第三批】增强：① 作者改用 artistMatch（支持多歌手切分/分隔符）② 时长容差 3s → 5s
+  //   （站点 playtime 常按整秒取整、片头片尾差异可达数秒，3s 过严会误杀本就正确的候选）
+  function isGoodMatch(cand, musicItem) {
+    var t = norm(musicItem.title), ar = norm(musicItem.artist);
+    var ct = norm(cand.title), ca = norm(cand.artist);
+    if (!t || !ct) return false;
+    if (ct.indexOf(t) < 0 && t.indexOf(ct) < 0) return false;              // 歌名必须互含
+    if (!artistMatch(ar, ca)) return false;                                // 作者匹配（增强：多歌手切分）
+    return durMatch(musicItem.duration, cand.duration, 5);                 // 时长一致（容差 5s）
+  }
+  function matchScore(c, musicItem) {
+    var t = norm(musicItem.title), ar = norm(musicItem.artist);
+    var ct = norm(c.title), ca = norm(c.artist), s = 0;
+    if (t && (ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0)) s += 2;
+    if (artistMatch(ar, ca) && ar && ca) s += 1;                           // 作者口径与 isGoodMatch 对齐
+    if (t && ct === t) s += 1;                                             // 歌名完全相等再加 1，压制「长尾包含」候选
+    return s;
+  }
+  async function mvPlayUrl(hash, cookie, signal) {
     var r = await axios.post(MV_BASE + '/style/js/play.php', 'id=' + hash + '&type=dance', {
       headers: {
         'User-Agent': MV_UA,
@@ -260,178 +539,715 @@
         'Referer': MV_BASE + '/mp3/' + hash + '.html', // 给 play.php 用，不是给音频 CDN 的
         'Cookie': cookie,
       },
-      timeout: 9000, validateStatus: function () { return true; },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
     });
     return r.data;
   }
-  async function mvSearch(keyword, cookie) {
+  async function mvSearch(keyword, cookie, signal) {
     var r = await axios.get(MV_BASE + '/so/' + encodeURIComponent(keyword || '') + '.html', {
       headers: { ...MV_HEADERS, 'Cookie': cookie },
-      timeout: 9000, validateStatus: function () { return true; },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
     });
-    if (mvIsVerify(r.data)) throw new Error('无名音乐网自动过验证失败（可能已升级为需手动验证），将自动回退 Tonzhon');
+    if (mvIsVerify(r.data)) throw new Error('无名音乐网自动过验证失败（可能已升级为需手动验证），将自动回退 aax / qeecc');
     return mvParseItems(r.data);
   }
-  async function mvGetMediaSource(musicItem) {
-    var kw = (musicItem.title || '').trim() || (musicItem.artist || '').trim();
-    if (!kw) throw new Error('歌曲标题为空，无法在无名音乐网检索');
-    var cookie = await ensureMvCookie();
-    var items;
-    try {
-      items = await mvSearch(kw, cookie);
-    } catch (e) {
-      if (_mvCookieUser && /验证/.test(e.message)) {
-        _mvCookie = null; _mvCookieUser = false;
-        cookie = await ensureMvCookie();
-        items = await mvSearch(kw, cookie);
-      } else throw e;
+  // onMatch(u)：记录「已通过身份校验 + safeUrl 过滤」的次优链，供整段超时/全失败时兜底返回
+  async function mvGetMediaSource(musicItem, signal, onMatch) {
+    if (!musicItem.title && !musicItem.artist) throw new Error('歌曲标题为空，无法在无名音乐网检索');
+    var cookie = await ensureMvCookie(false, signal);
+    // 【v0.1.6 第三批】检索关键词改为「全名（含括号注解）/ 剥离注解」双查竞速（原仅剥离注解单查）
+    function doSearch(kw, sig) {
+      return mvSearch(kw, cookie, sig).catch(function (e) {
+        if (_mvCookieUser && /验证/.test(e.message)) {   // 会话被判失效 → 清 jar 重验一次再试
+          _mvCookie = null; _mvCookieUser = false;
+          return ensureMvCookie(false, sig).then(function (c) { cookie = c; return mvSearch(kw, cookie, sig); });
+        }
+        throw e;
+      });
     }
-    if (!items.length) throw new Error('无名音乐网未找到：' + kw);
-    var ordered = mvRank(items, musicItem);
-    if (!ordered.length) ordered = items;
+    var q = await dualTitleSearch(doSearch, musicItem, signal);
+    var items = q.items, kw = q.kw;
+    if (!items.length) {
+      if (q.error) throw q.error;                        // 保留「验证失败」等可诊断原因，便于整段错误聚合
+      throw new Error('无名音乐网未找到：' + kw);
+    }
+    // 优先取通过多重身份校验的候选；无严格匹配则退化为按相关度排序
+    var matched = items.filter(function (c) { return isGoodMatch(c, musicItem); });
+    var ordered = (matched.length ? matched : items).slice().sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); });
     var lastErr = '';
-    for (var i = 0; i < Math.min(ordered.length, 5); i++) {
+    for (var i = 0; i < Math.min(ordered.length, 2); i++) { // 候选数 5→2，砍掉冗余延迟
       try {
-        var d = await mvPlayUrl(ordered[i].id, cookie);
-        if (d && d.url) return { url: d.url }; // 不带 Referer，否则 CDN 403
-        lastErr = d && d.msg ? String(d.msg) : '空链接';
+        var d = await mvPlayUrl(ordered[i].id, cookie, signal);
+        if (d && d.url) {
+          // 【v0.1.4】顺手把该源歌词写入缓存：mvmp3 的 play.php 直接内联 lrc，零额外请求
+          if (d.lrc) lrcCacheSet(musicItem, d.lrc);
+          var u = safeUrl(d.url);
+          if (u && onMatch) onMatch(u); // 记录次优链（已过滤 HLS/非法链）
+          if (u && await validatePlayable(u, signal)) return { url: u }; // 不带 Referer（否则 CDN 403）
+          lastErr = d && d.msg ? String(d.msg) : '空链接';
+        }
       } catch (e) { lastErr = e.message; }
     }
     throw new Error('无名音乐网可取链候选均已下架/不可播放（' + (lastErr || '无可用链接') + '）');
   }
 
-  // ===================== 备用音源②：Tonzhon 网易云匹配（tonzhon.com 搜索 + 网易云 weapi 取链） =====================
-  // 说明：QQ 官方对 VIP/试听曲取链受限；Tonzhon 对 QQ 搜索会回退网易云匹配同名曲，再用纯 JS weapi(AES-128-CBC)
-  //       取链，不依赖 QQ 登录态，能有效覆盖 QQ 的 VIP/试听失效场景。weapi 实现为零外部依赖纯 JS（桌面/移动端通用），
-  //       移植自本仓库已验证的 xiage.js。
-  var TZ = 'https://tonzhon.com/api.php';
-  var NETEASE_WEAPI = 'https://music.163.com/weapi/song/enhance/player/url/v1?csrf_token=';
-  var TZ_UA = CHROME_UA;
-  function tzPost(types, extra) {
-    var data = Object.assign({ types: types }, extra || {});
-    var keys = Object.keys(data), parts = [];
-    for (var i = 0; i < keys.length; i++) parts.push(keys[i] + '=' + encodeURIComponent(data[keys[i]]));
-    return axios
-      .post(TZ, parts.join('&'), {
-        headers: { 'User-Agent': TZ_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://tonzhon.com/' },
-        timeout: 15000,
-      })
-      .then(function (r) { return r.data; });
-  }
-  function flattenArtist(a) {
-    if (!a) return '';
-    if (typeof a === 'string') return a;
-    if (Array.isArray(a)) {
-      var out = [];
-      for (var i = 0; i < a.length; i++) {
-        var x = a[i];
-        if (typeof x === 'string') out.push(x);
-        else if (Array.isArray(x)) out.push(x.join('/'));
-        else if (x && x.name) out.push(x.name);
-      }
-      return out.filter(Boolean).join('/');
+  // ===================== 备用音源②：aax.cx（AAX音乐网）／③：qeecc.com（无忧音乐网） =====================
+  // 【v0.1.3】删除原 Tonzhon 源，新增 aax.cx 与 qeecc.com 两个酷我系聚合站（取代网易云匹配方案）。
+  // 两站同源 CMS：人机验证页与 mvmp3 同构，取链同为 POST /js/play.php；差异仅在「搜索条目文案 / 详情链接」，
+  // 故抽象为「参数化 base + 站点解析器」的通用实现：
+  //   · 验证：GET base/ 见「安全人机验证」→ 取 csrf_token → POST base/(csrf_token&human_check=on) → 302 → 缓存 Set-Cookie；
+  //   · 搜索：GET base/so/<urlencoded kw>.html（必须先过人机验证；未验证会返回验证页）；
+  //   · 取链：POST base/js/play.php(id&type=music) → JSON.url（该端点实测无需验证）。
+  // 注：两站取到的多为酷我系直链（aax 的 s.5bb3.com/*.m4a 常 302 到 car-bj.kuwo.cn/*.aac）。
+  var SITE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+  var SITE_COOKIE_TTL = 50 * 60 * 1000; // 50 分钟（站点会话约 1 小时，留余量）
+  // 站点 Cookie 会话：按 base 分别缓存（aax 与 qeecc 各自独立）
+  var _siteCookie = {};
+  function siteCookieOf(base) { return _siteCookie[base] || (_siteCookie[base] = { ck: null, at: 0 }); }
+  function siteIsVerify(html) { return /安全人机验证|我不是人机|verifyForm/.test(html || ''); }
+  // 自动过人机验证（与 mvmp3 同构）：先建会话，若见验证页则提交 csrf_token + human_check
+  async function siteAutoVerify(base, signal) {
+    var r1 = await axios.get(base + '/', {
+      headers: { 'User-Agent': SITE_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var setCk = (r1.headers && r1.headers['set-cookie']) || [];
+    var jar = {};
+    function absorb(list) {
+      (list || []).forEach(function (c) {
+        var i = c.indexOf('=');
+        if (i > 0) jar[c.slice(0, i).trim()] = c.split(';')[0].split('=').slice(1).join('=').trim();
+      });
     }
-    return '';
+    absorb(setCk);
+    var ck = Object.keys(jar).map(function (k) { return k + '=' + jar[k]; }).join('; ');
+    if (!ck) throw new Error('无法建立会话');
+    if (!siteIsVerify(r1.data)) return ck; // 已是已验证会话（极小概率）
+    var m = (r1.data || '').match(/name="csrf_token" value="([^"]+)"/);
+    var csrf = m ? m[1] : '';
+    var r2 = await axios.post(base + '/', 'csrf_token=' + encodeURIComponent(csrf) + '&human_check=on', {
+      headers: { 'User-Agent': SITE_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: base + '/', Cookie: ck },
+      timeout: SRC_TIMEOUT, maxRedirects: 5, signal: signal, validateStatus: function () { return true; },
+    });
+    absorb(r2 && r2.headers && r2.headers['set-cookie']); // 验证成功后服务端续期 Cookie，合并回 jar
+    return Object.keys(jar).map(function (k) { return k + '=' + jar[k]; }).join('; ');
   }
-  // --- 网易云 weapi 纯 JS AES-128-CBC（零外部依赖，桌面/移动端沙箱通用）---
-  var WEAPI_NONCE = '0CoJUm6Qyw8W8jud';
-  var WEAPI_IV = '0102030405060708';
-  var WEAPI_SEC_KEY = '0CoJUm6Qyw8W8jud'; // 固定外层 AES 密钥（第三方客户端通用做法）
-  var WEAPI_ENC_SEC_KEY =
-    'bf50d0bcf56833b06d8d1219496a452a1d860fd58a14c0aafba3e770104ca77dc6856cb310ed3309039e6865081be4ddc2df52663373b20b70ac25b4d0c6ca466daef6b50174e93536e2d580c49e70649ad1936584899e85722eb83ceddfb4f56c1172fca5e60592d0e6ee3e8e02be1fe6e53f285b0389162d8e6ddc553857cd'; // RSA(reversed(SEC_KEY)) 预计算常量
-  var _SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16];
-  var _RCON = [0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000,0x80000000,0x1b000000,0x36000000];
-  function _subWord(w){return (_SBOX[(w>>>24)&0xff]<<24)|(_SBOX[(w>>>16)&0xff]<<16)|(_SBOX[(w>>>8)&0xff]<<8)|_SBOX[w&0xff];}
-  function _rotWord(w){return ((w<<8)|(w>>>24))>>>0;}
-  function _keyExp(key){var Nk=4,Nr=10;var w=new Array(44);for(var i=0;i<Nk;i++)w[i]=(key[4*i]<<24)|(key[4*i+1]<<16)|(key[4*i+2]<<8)|key[4*i+3];for(var i=Nk;i<44;i++){var t=w[i-1];if(i%Nk===0)t=_subWord(_rotWord(t))^_RCON[(i/Nk)-1];w[i]=(w[i-Nk]^t)>>>0;}return w;}
-  function _gfMul(a,b){var p=0;for(var i=0;i<8;i++){if(b&1)p^=a;var hi=a&0x80;a=(a<<1)&0xff;if(hi)a^=0x1b;b>>=1;}return p&0xff;}
-  function _encBlock(block,w){var Nr=10;var s=block.slice();var addRK=function(rnd){for(var c=0;c<4;c++){var word=w[rnd*4+c];s[c*4]^=(word>>>24)&0xff;s[c*4+1]^=(word>>>16)&0xff;s[c*4+2]^=(word>>>8)&0xff;s[c*4+3]^=word&0xff;}};addRK(0);for(var r=1;r<Nr;r++){for(var i=0;i<16;i++)s[i]=_SBOX[s[i]];var sh=s.slice();for(var row=1;row<4;row++)for(var c=0;c<4;c++)s[c*4+row]=sh[((c+row)%4)*4+row];for(var c=0;c<4;c++){var i=c*4;var a0=s[i],a1=s[i+1],a2=s[i+2],a3=s[i+3];s[i]=_gfMul(a0,2)^_gfMul(a1,3)^a2^a3;s[i+1]=a0^_gfMul(a1,2)^_gfMul(a2,3)^a3;s[i+2]=a0^a1^_gfMul(a2,2)^_gfMul(a3,3);s[i+3]=_gfMul(a0,3)^a1^a2^_gfMul(a3,2);}addRK(r);}for(var i=0;i<16;i++)s[i]=_SBOX[s[i]];var sh=s.slice();for(var row=1;row<4;row++)for(var c=0;c<4;c++)s[c*4+row]=sh[((c+row)%4)*4+row];addRK(Nr);return s;}
-  function _utf8Bytes(str){var out=[];for(var i=0;i<str.length;i++){var c=str.charCodeAt(i);if(c<0x80)out.push(c);else if(c<0x800){out.push(0xc0|(c>>6),0x80|(c&0x3f));}else if(c<0xd800||c>=0xe000){out.push(0xe0|(c>>12),0x80|((c>>6)&0x3f),0x80|(c&0x3f));}else{i++;c=0x10000+(((c&0x3ff)<<10)|(str.charCodeAt(i)&0x3ff));out.push(0xf0|(c>>18),0x80|((c>>12)&0x3f),0x80|((c>>6)&0x3f),0x80|(c&0x3f));}}return out;}
-  function _toB64(bytes){var CH='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';var s='';for(var i=0;i<bytes.length;i+=3){var b0=bytes[i],b1=i+1<bytes.length?bytes[i+1]:0,b2=i+2<bytes.length?bytes[i+2]:0;var n=(b0<<16)|(b1<<8)|b2;s+=CH[(n>>18)&0x3f]+CH[(n>>12)&0x3f]+(i+1<bytes.length?CH[(n>>6)&0x3f]:'=')+(i+2<bytes.length?CH[n&0x3f]:'=');}return s;}
-  function _pkcs7(b,bs){var p=bs-(b.length%bs);var o=b.slice();for(var i=0;i<p;i++)o.push(p);return o;}
-  function _aesCbc(text,keyStr){var kb=_utf8Bytes(keyStr),ivb=_utf8Bytes(WEAPI_IV);var pt=_pkcs7(_utf8Bytes(text),16);var w=_keyExp(kb);var out=[];var prev=ivb.slice();for(var b=0;b<pt.length;b+=16){var blk=pt.slice(b,b+16).map(function(x,i){return x^prev[i];});var e=_encBlock(blk,w);for(var i=0;i<16;i++)out.push(e[i]);prev=e;}return _toB64(out);}
-  function weapiEncrypt(text) {
-    var p1 = _aesCbc(text, WEAPI_NONCE);
-    var p2 = _aesCbc(p1, WEAPI_SEC_KEY);
-    return { params: p2, encSecKey: WEAPI_ENC_SEC_KEY };
+  async function siteEnsureCookie(base, signal) {
+    var st = siteCookieOf(base), now = Date.now();
+    if (st.ck && (now - st.at) < SITE_COOKIE_TTL) return st.ck;
+    var fresh = await siteAutoVerify(base, signal);
+    st.ck = fresh; st.at = now; return fresh;
   }
-  // 直连网易云 weapi 取播放直链（返回 http(s) CDN；下架/变灰曲返回 null）
-  function getNeteaseUrl(id) {
-    try {
-      var payload = JSON.stringify({ ids: '[' + id + ']', level: 'standard', encodeType: 'mp3', csrf_token: '' });
-      var enc = weapiEncrypt(payload);
-      var reqBody = 'params=' + encodeURIComponent(enc.params) + '&encSecKey=' + encodeURIComponent(enc.encSecKey);
-      return axios
-        .post(NETEASE_WEAPI, reqBody, {
-          headers: { 'User-Agent': TZ_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://music.163.com/' },
-          timeout: 10000,
-        })
-        .then(function (r) {
-          var u = r.data && r.data.data && r.data.data[0] ? r.data.data[0].url : null;
-          return u || null;
-        })
-        .catch(function (e) { return null; });
-    } catch (e) {
-      return Promise.resolve(null);
+  // 「歌手 - 歌名」+「MM:SS」→ {artist,title,duration(ms)}
+  function splitDashTitle(raw, time) {
+    raw = raw || '';
+    var title = raw, artist = '';
+    var idx = raw.indexOf(' - ');
+    if (idx > 0) { artist = raw.slice(0, idx).trim(); title = raw.slice(idx + 3).trim(); }
+    artist = artist.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+    title = title.replace(/^[【\[]+|[】\]]+$/g, '').trim();
+    var dur;
+    var tm = (time || '').match(/(\d{1,2}):(\d{2})/);
+    if (tm) dur = (parseInt(tm[1], 10) * 60 + parseInt(tm[2], 10)) * 1000;
+    return { title: title, artist: artist, duration: dur };
+  }
+  // aax.cx 搜索条目：<a href="/s/<32hex>.html" … title="歌手 - 歌名">…<span class="playtime">MM:SS</span>
+  // 【v0.1.3】条目含 playtime → 可取到「时长」，纳入 isGoodMatch 时长校验，防同名异人/异长错曲。
+  function aaxParseItems(html) {
+    if (!html || typeof html !== 'string') return [];
+    var items = [], seen = {};
+    var re = /<a\s+href="\/s\/([0-9a-f]{32})\.html"[^>]*\btitle="([^"]*)"[\s\S]*?(?:class="playtime">([^<]*)<|<\/li>)/gi;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1];
+      if (seen[id]) continue;
+      seen[id] = 1;
+      var it = splitDashTitle(m[2], m[3]);
+      if (it.title) items.push({ id: id, title: it.title, artist: it.artist, duration: it.duration });
     }
+    return items;
   }
-  function forceHttps(u) { return String(u).replace(/^http:\/\//i, 'https://'); }
-  // 试听片段探测（移动端兼容版：不用 stream，仅读响应头）。30s@128kbps≈500KB，完整曲通常≥2MB，阈值取 1.2MB。
-  // 无法判断时返回 false，绝不误伤完整曲、绝不阻塞播放。
-  function looksLikePreview(url) {
-    if (!url || typeof url !== 'string') return Promise.resolve(false);
-    var u = forceHttps(url);
-    return axios
-      .get(u, {
-        headers: { 'User-Agent': TZ_UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
-        timeout: 5000,
-        validateStatus: function () { return true; },
-      })
-      .then(function (r) {
-        var cr = r.headers && r.headers['content-range'];
-        if (cr) {
-          var m = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
-          if (m) { var total = parseInt(m[1], 10); return total > 0 && total < 1.2 * 1024 * 1024; }
+  // qeecc.com 搜索条目：<div class="name"><a href="/song/<id>.html" target="_mp3">歌手《歌名》[MP3]</a></div>
+  function qeParseItems(html) {
+    if (!html || typeof html !== 'string') return [];
+    var items = [], seen = {};
+    var re = /<a\s+href="\/song\/([A-Za-z0-9_\-]+)\.html"[^>]*>([^<]*)<\/a>/gi;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1];
+      if (seen[id]) continue;
+      seen[id] = 1;
+      var txt = (m[2] || '').replace(/&nbsp;/g, ' ').replace(/\s*\[[^\]]*\]\s*$/, '').trim(); // 去尾部 [MP3]/[Mp3_Lrc]
+      var artist = '', title = txt;
+      var mm = txt.match(/^([\s\S]*?)《([\s\S]*?)》\s*$/);
+      if (mm) { artist = mm[1].trim(); title = mm[2].trim(); }
+      else { var idx = txt.indexOf(' - '); if (idx > 0) { artist = txt.slice(0, idx).trim(); title = txt.slice(idx + 3).trim(); } }
+      if (title) items.push({ id: id, title: title, artist: artist });
+    }
+    return items;
+  }
+  // 站点配置（参数化 base + 详情路径 + 解析器）：aax 与 qeecc 同源 CMS，仅此三处不同
+  var AAX = { name: 'AAX音乐网', base: 'https://www.aax.cx', detail: '/s/', parse: aaxParseItems };
+  var QEECC = { name: '无忧音乐网', base: 'https://www.qeecc.com', detail: '/song/', parse: qeParseItems };
+  async function siteSearch(cfg, kw, cookie, signal) {
+    var r = await axios.get(cfg.base + '/so/' + encodeURIComponent(kw || '') + '.html', {
+      headers: { 'User-Agent': SITE_UA, 'Accept-Language': 'zh-CN,zh;q=0.9', Cookie: cookie },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    if (siteIsVerify(r.data)) throw new Error(cfg.name + '：自动过验证失败（可能已升级），跳过该源');
+    return cfg.parse(r.data);
+  }
+  async function sitePlayUrl(cfg, id, cookie, signal) {
+    var r = await axios.post(cfg.base + '/js/play.php', 'id=' + encodeURIComponent(id) + '&type=music', {
+      headers: {
+        'User-Agent': SITE_UA,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+        Referer: cfg.base + cfg.detail + id + '.html', // 详情页 Referer（play.php 实测不严格校验，带上更稳）
+        Cookie: cookie,
+      },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    return r.data;
+  }
+  // onMatch(u)：记录「已通过身份校验 + safeUrl 过滤」的次优链，供整段超时/全失败兜底
+  async function siteGetMediaSource(cfg, musicItem, signal, onMatch) {
+    if (!musicItem.title && !musicItem.artist) throw new Error('歌曲标题为空，无法在' + cfg.name + '检索');
+    var cookie = await siteEnsureCookie(cfg.base, signal);
+    // 【v0.1.6 第三批】检索关键词改为「全名（含括号注解）/ 剥离注解」双查竞速（原仅剥离注解单查）
+    function doSearch(kw, sig) {
+      return siteSearch(cfg, kw, cookie, sig).catch(function (e) {
+        if (siteIsVerify(String(e && e.message))) throw e;   // 仍是验证页 → 放弃该源（错误上抛，聚合进整段原因）
+        siteCookieOf(cfg.base).ck = null;                    // 会话可能失效 → 强制重验一次
+        return siteEnsureCookie(cfg.base, sig).then(function (c) { cookie = c; return siteSearch(cfg, kw, cookie, sig); });
+      });
+    }
+    var q = await dualTitleSearch(doSearch, musicItem, signal);
+    var items = q.items, kw = q.kw;
+    if (!items.length) {
+      if (q.error) throw q.error;
+      throw new Error(cfg.name + '未找到：' + kw);
+    }
+    // 优先取通过多重身份校验（歌名+作者+时长）的候选；无严格匹配则退化为按相关度排序
+    var matched = items.filter(function (c) { return isGoodMatch(c, musicItem); });
+    var ordered = (matched.length ? matched : items).slice().sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); });
+    var lastErr = '';
+    for (var i = 0; i < Math.min(ordered.length, 3); i++) {
+      try {
+        var d = await sitePlayUrl(cfg, ordered[i].id, cookie, signal);
+        if (d && d.url) {
+          // 【v0.1.4】该源若带歌词（aax 的 lrc 是 URL），后台预取入缓存——不阻塞取链
+          if (d.lrc) prefetchSiteLrc(d.lrc, musicItem);
+          var u = safeUrl(d.url);
+          if (u && onMatch) onMatch(u); // 记录次优链（已过滤 HLS/非法链）
+          if (u && await validatePlayable(u, signal)) return { url: u };
+          lastErr = d.msg ? String(d.msg) : '空链接';
         }
-        var cl = r.headers && r.headers['content-length'] ? parseInt(r.headers['content-length'], 10) : 0;
-        return cl > 0 && cl < 1.2 * 1024 * 1024;
-      })
-      .catch(function () { return false; });
-  }
-  // 按歌名+歌手匹配网易云并返回「首个完整」直链（遍历前若干候选，排除试听片段，返回首个完整链；全试听则退回最后一个非空）。
-  async function getNeteaseUrlForQuery(name, artist) {
-    if (!name) return null;
-    var arr = await tzPost('search', { source: 'netease', name: name, pages: 1, count: 8 });
-    var list = Array.isArray(arr) ? arr : [];
-    if (!list.length) return null;
-    var lastAny = null;
-    for (var k = 0; k < list.length; k++) {
-      var id = list[k] && list[k].id ? String(list[k].id) : null;
-      if (!id) continue;
-      var u = await getNeteaseUrl(id);
-      if (!u) continue;
-      lastAny = u; // 记录最近一个非空直链，供全试听时兜底
-      var isPrev = await looksLikePreview(u);
-      if (!isPrev) return u; // 完整命中
+      } catch (e) { lastErr = e.message; }
     }
-    return lastAny; // 全是试听则退回最后一个非空（至少能播）
+    throw new Error(cfg.name + '可取链候选均不可播（' + (lastErr || '无可用链接') + '）');
   }
 
-  // ---------- 取链（三层兜底：官方 QQ → mvmp3 → Tonzhon 网易云匹配） ----------
+  // ==================================================================================
+  // 备用音源 ⑤⑥⑦：聚合 API 型（【v0.1.6 第四~六批】）
+  // ----------------------------------------------------------------------------------
+  // 与 ②③④（酷我系 HTML 站点）的本质差异：这三源都是「单端点 + 查询参数 → JSON」，
+  //   无需人机验证握手、无需登录 Cookie、返回结构化字段（歌名/歌手/时长），
+  //   故不套用 HTML 解析与人机验证逻辑，而是共用一套适配器（apiSourceGetMediaSource）。
+  // 三源契约均以【真机实抓】确认（脚本：probe_new_sources.js / probe_new_sources2.js），
+  //   严格遵循「API 抓包优先，不猜 URL」，抓包结论逐条写入下方注释。
+  // 采纳顺序（船长指定验收顺序）：官方 → ⑤音乐搜索神器 → ⑥GD音乐台 → ⑦MyFreeMP3
+  //                              → ②aax.cx → ③mvmp3.com → ④qeecc.com
+  // ==================================================================================
+
+  // 零依赖表单编码（不依赖 URLSearchParams：部分移动端 JS 引擎未内置，会直接抛错使整源失效）
+  function formBody(obj) {
+    var out = [];
+    Object.keys(obj).forEach(function (k) {
+      var v = obj[k];
+      if (v === undefined || v === null) return;
+      out.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
+    });
+    return out.join('&');
+  }
+  // 数组字段归一（GD 的 artist 是数组，MyFreeMP3 的 artists 是字符串）
+  function joinIfArray(v) {
+    if (Object.prototype.toString.call(v) === '[object Array]') return v.join('、');
+    return v || '';
+  }
+  // 时长归一为毫秒（<1000 视为秒；缺失返回 undefined，交由 durMatch 免否决）
+  function toMs(v) {
+    var n = Number(v);
+    if (!isFinite(n) || n <= 0) return undefined;
+    return n < 1000 ? n * 1000 : n;
+  }
+
+  // ---------- ⑤ 音乐搜索神器 music.lmb520.cn（基于 maicong/music 聚合） ----------
+  // 契约（实抓）：POST /  form: input=<kw|songid>&filter=name|id&type=<平台>&page=1
+  //   搜索返回 {code:200, data:[{type,link,songid,title,author,lrc,url,pic}]}
+  //   filter=id 返回同构对象（含 url），url 形如 http://music.163.com/song/media/outer/url?id=xxx.mp3（302 跳真实 CDN）
+  // ⚠️ 实测平台差异（务必保留此结论）：
+  //   · type=netease 可搜可取链 ✓
+  //   · type=qq      可搜（songid 为 QQ songmid）但 **filter=id 返回 403「目前还不支持这个网站」** → QQ 平台取不到链
+  //   · type=tencent 直接 403（站点不认该写法）
+  //   故搜索仅并发「可取链」的平台，id 编码为 <plat>:<songid>，取链时按编码平台回查。
+  var SQ_BASE = 'https://music.lmb520.cn/';
+  var SQ_PLATS = ['netease', 'kuwo', 'kugou'];   // 实测可搜且可取链的三个平台（限 3 个控请求数）
+  function sqReq(body, signal) {
+    return axios.post(SQ_BASE, formBody(body), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': SITE_UA, 'Referer': SQ_BASE, 'X-Requested-With': 'XMLHttpRequest',
+      },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+  }
+  function sqParseItems(raw, plat) {
+    var d = toObj(raw);
+    if (!d || d.code !== 200 || Object.prototype.toString.call(d.data) !== '[object Array]') return [];
+    var out = [];
+    d.data.forEach(function (it) {
+      if (!it || !it.title) return;
+      out.push({
+        id: plat + ':' + String(it.songid != null ? it.songid : it.id),
+        title: it.title, artist: it.author || '', duration: undefined,   // 该接口不返回时长
+      });
+    });
+    return out;
+  }
+  async function sqSearch(kw, signal) {
+    var lists = await Promise.all(SQ_PLATS.map(function (plat) {
+      return sqReq({ input: kw, filter: 'name', type: plat, page: 1 }, signal)
+        .then(function (r) { return sqParseItems(r.data, plat); })
+        .catch(function () { return []; });
+    }));
+    var merged = [], seen = {};
+    lists.forEach(function (arr) {
+      arr.forEach(function (it) {
+        var k = String(it.id);
+        if (seen[k]) return;
+        seen[k] = 1; merged.push(it);
+      });
+    });
+    return merged;
+  }
+  async function sqGetUrl(id, quality, signal) {
+    var s = String(id), i = s.indexOf(':');
+    var plat = i > 0 ? s.slice(0, i) : 'netease';
+    var sid = i > 0 ? s.slice(i + 1) : s;
+    var r = await sqReq({ input: sid, filter: 'id', type: plat, page: 1 }, signal);
+    var d = toObj(r.data);
+    if (d && d.code && d.code !== 200) throw new Error('音乐搜索神器 ' + plat + '：' + (d.error || ('code ' + d.code)));
+    var it = (d && Object.prototype.toString.call(d.data) === '[object Array]' && d.data[0]) || null;
+    if (!it || !it.url) throw new Error('音乐搜索神器 ' + plat + ' 未返回播放链接');
+    return { url: it.url };
+  }
+  var SQ_SRC = { name: '音乐搜索神器', search: sqSearch, getUrl: sqGetUrl };
+
+  // ---------- ⑥ GD音乐台 music-api.gdstudio.xyz ----------
+  // 契约（实抓）：GET api.php?btwaf=99801110&types=search|url|lyric&source=<src>&...
+  //   search → JSON 数组 [{id,name,artist[数组],album,pic_id,url_id,lyric_id,source,from}]（**不含时长**）
+  //   url    → {url,br,size}（直链，实测 m801.music.126.net/*.mp3 → 200 + audio/mpeg）
+  //   lyric  → {lyric}
+  // ⚠️ 实测 source 白名单极窄：仅 **netease / joox** 可用；tencent/kuwo/kugou/migu/spotify/ytmusic/
+  //   tidal/qobuz/deezer/apple 一律 400「Value of `source` is not supported.」。joox 为腾讯国际版，
+  //   华语（尤其周杰伦等）命中性好，故 netease + joox 双源并发。
+  var GD_API = 'https://music-api.gdstudio.xyz/api.php?btwaf=99801110';
+  var GD_SRCS = ['netease', 'joox'];
+  function gdReq(params, signal) {
+    return axios.get(GD_API, {
+      params: params,
+      headers: { 'User-Agent': SITE_UA, 'Accept': 'application/json' },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+  }
+  function gdParseItems(raw, src) {
+    var d = toObj(raw);
+    if (Object.prototype.toString.call(d) !== '[object Array]') return [];
+    var out = [];
+    d.forEach(function (it) {
+      if (!it || !it.name || it.id === undefined || it.id === null) return;
+      out.push({
+        id: src + ':' + String(it.id),
+        title: it.name,
+        artist: joinIfArray(it.artist),
+        duration: toMs(it.duration),   // 实测缺失 → undefined（不据此否决）
+      });
+    });
+    return out;
+  }
+  async function gdSearch(kw, signal) {
+    var lists = await Promise.all(GD_SRCS.map(function (src) {
+      return gdReq({ types: 'search', source: src, name: kw, count: 20, pages: 1 }, signal)
+        .then(function (r) { return gdParseItems(r.data, src); })
+        .catch(function () { return []; });
+    }));
+    var merged = [], seen = {};
+    lists.forEach(function (arr) {
+      arr.forEach(function (it) {
+        var k = String(it.id);
+        if (seen[k]) return;
+        seen[k] = 1; merged.push(it);
+      });
+    });
+    return merged;
+  }
+  // 音质→br 映射（站点口径：128/192/320/740=flac/999=hires）；空链自动降级到 320 → 128
+  function gdBrOf(quality) {
+    if (quality === 'flac' || quality === 'super') return '740';
+    if (quality === '320' || quality === 'high') return '320';
+    if (quality === 'low' || quality === 'm4a') return '128';
+    return '320';
+  }
+  async function gdGetUrl(id, quality, signal) {
+    var s = String(id), i = s.indexOf(':');
+    var src = i > 0 ? s.slice(0, i) : 'netease';
+    var sid = i > 0 ? s.slice(i + 1) : s;
+    var chain = [gdBrOf(quality), '320', '128'].filter(function (v, idx, a) { return a.indexOf(v) === idx; });
+    var lastErr = '';
+    for (var j = 0; j < chain.length; j++) {
+      try {
+        var r = await gdReq({ types: 'url', source: src, id: sid, br: chain[j] }, signal);
+        var d = toObj(r.data);
+        if (d && d.url) return { url: d.url };
+        lastErr = 'br=' + chain[j] + ' 无链接';
+      } catch (e) { lastErr = e.message; }
+    }
+    throw new Error('GD音乐台 ' + src + '：' + (lastErr || '无可用链接'));
+  }
+  var GD_SRC = { name: 'GD音乐台', search: gdSearch, getUrl: gdGetUrl };
+
+  // ---------- ⑦ MyFreeMP3（mp3.zaodoc.com；实际接口在 www.puduoduo.top 的 Z-Blog kk_music 插件） ----------
+  // ⚠️ 抓包结论：船长所给 `api.liumingye.cn` 已下线（实测 **HTTP 522 Connection timed out**，
+  //   `music.liumingye.cn` 亦已改版为「全盘搜」网盘引擎，均不可用）；`mp3.zaodoc.com` 前台可用，
+  //   其 main.js 暴露真实接口 = `https://www.puduoduo.top/zb_users/plugin/kk_music/api.php?act=`。
+  // 契约（实抓，**免 Cookie**）：
+  //   searchmusic&word=<kw>&limit=50 → {code:200, data:{songs:[{id,name,artists,album,picUrl,duration}]}}
+  //     注：duration 为**毫秒**（如 278961≈279s）→ 可直接用于时长校验
+  //   musicurl&id=<id>&quality=standard|320|flac|lossless → {code:200, data:{url,...}}（无该音质时 url 为空串）
+  //   lyric&id=<id> → {code:200, data:{lyric}}
+  //   另有 www.puduoduo.top/verify.php（站点反爬验证页，实测普通 UA 直接调 API 即可，无需握手）
+  var MYF_API = 'https://www.puduoduo.top/zb_users/plugin/kk_music/api.php?act=';
+  var MYF_HEADERS = { 'User-Agent': SITE_UA, 'Accept': 'application/json, text/plain, */*', 'Referer': 'https://www.puduoduo.top/' };
+  async function myfSearch(kw, signal) {
+    var r = await axios.get(MYF_API + 'searchmusic', {
+      params: { word: kw, limit: 30 },
+      headers: MYF_HEADERS, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var d = toObj(r.data);
+    var songs = (d && d.data && d.data.songs) || [];
+    var out = [];
+    songs.forEach(function (it) {
+      if (!it || !it.name || it.id === undefined || it.id === null) return;
+      out.push({ id: 'myf:' + String(it.id), title: it.name, artist: it.artists || '', duration: toMs(it.duration) });
+    });
+    return out;
+  }
+  async function myfGetUrl(id, quality, signal) {
+    var s = String(id), i = s.indexOf(':');
+    var sid = i > 0 ? s.slice(i + 1) : s;
+    var want = (quality === 'flac' || quality === 'super') ? 'flac' : (quality === '320' || quality === 'high') ? '320' : 'standard';
+    var chain = [want, 'standard'].filter(function (v, idx, a) { return a.indexOf(v) === idx; });
+    var lastErr = '';
+    for (var j = 0; j < chain.length; j++) {
+      try {
+        var r = await axios.get(MYF_API + 'musicurl', {
+          params: { id: sid, quality: chain[j] },
+          headers: MYF_HEADERS, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+        });
+        var d = toObj(r.data);
+        var u = d && d.data && d.data.url;
+        if (u) return { url: u };
+        lastErr = 'quality=' + chain[j] + ' 无链接';
+      } catch (e) { lastErr = e.message; }
+    }
+    throw new Error('MyFreeMP3：' + (lastErr || '无可用链接'));
+  }
+  var MYF_SRC = { name: 'MyFreeMP3', search: myfSearch, getUrl: myfGetUrl };
+
+  // ---------- 聚合 API 型备用源统一适配器 ----------
+  // 流程：检索（先全名、剥离名兜底）→ isGoodMatch 身份校验精筛 → matchScore 排序 → 逐候选取链 + 可播性探测。
+  // 检索走【串行双查】dualTitleSearchSeq（非并发并集）：聚合源单次检索已返回 20—30 条模糊候选，
+  //   且并发双查会成倍放请求（本适配器有 3 个源，并发即 6 路），故按船长指令「先用全名、剥离名作兜底」串行执行。
+  async function apiSourceGetMediaSource(src, musicItem, quality, signal, onMatch) {
+    var q = await dualTitleSearchSeq(function (kw, sig) { return src.search(kw, sig); }, musicItem, signal);
+    var items = q.items || [];
+    if (!items.length) {
+      if (q.error) throw q.error;
+      throw new Error(src.name + '未找到：' + q.kw);
+    }
+    var matched = items.filter(function (c) { return isGoodMatch(c, musicItem); });
+    var ordered = (matched.length ? matched : items).slice().sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); });
+    var lastErr = '';
+    var limit = Math.min(ordered.length, API_CANDIDATES);
+    for (var i = 0; i < limit; i++) {
+      try {
+        var d = await src.getUrl(ordered[i].id, quality, signal);
+        var u = d && d.url ? safeUrl(d.url) : null;
+        if (u && onMatch) onMatch(u);                       // 记录次优链（供整段超时兜底）
+        if (u && await validatePlayable(u, signal)) return { url: u };
+        lastErr = '空链接或不可播';
+      } catch (e) { lastErr = e.message; }
+    }
+    throw new Error(src.name + '可取链候选均不可播（' + (lastErr || '无可用链接') + '）');
+  }
+
+  // 播放链安全闸门：仅放行「绝对 http(s) 直链」且非 HLS(.m3u8/.m3u) 的 URL。
+  // 兜底音源（aax / mvmp3 / qeecc）偶会回吐 HTML 页面、相对路径或 HLS 流，直接交给原生播放器会触发
+  // 原生层崩溃（闪退）；此处一律拒之门外，让 getMediaSource 干净抛错（MusicFree 捕获后仅提示“播放失败”）。
+  function safeUrl(u) {
+    if (!u || typeof u !== 'string') return null;
+    u = String(u).trim();
+    if (!/^https?:\/\//i.test(u)) return null;                                  // 拒绝相对/协议相对/blob/data
+    if (/\.m3u8(\?|$)/i.test(u) || /\.m3u(\?|$)/i.test(u)) return null;         // 拒绝 HLS（原生播放器易崩）
+    return u;                                                                    // 原样返回：官方明文 http 与兜底 https 均经实测可播，不做 forceHttps（那会重新引入 TLS 崩溃）
+  }
+  // 播放前“可播放性”实时探测（兜底安全网）：仅当响应【明确不是音频】(404/403 或 text/html) 才判不可用，
+  // 让上层继续走下一个兜底源；网络错误(超时/DNS/Abort)则“信任放行”，避免误杀本可播放的链。
+  // 这样即便某 CDN 节点对错误 vkey 回 HTML，也绝不会把崩溃性 URL 交给原生播放器。
+  async function validatePlayable(url, signal) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': CHROME_UA, Referer: 'https://y.qq.com/', Range: 'bytes=0-0' },
+        timeout: VALIDATE_TIMEOUT, signal: signal, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var st = r.status;
+      var ct = (r.headers && r.headers['content-type']) || '';
+      if (st >= 200 && st < 300 && /audio|video|application\/octet-stream/i.test(ct)) return true;
+      // 【v0.1.3】未跟随到底的重定向（如 aax 的 s.5bb3.com/*.m4a 会 302 到酷我 car-bj.kuwo.cn/*.aac）
+      // 一律信任放行：它已证明「路径存在且可跳转」，交原生播放器自行跟随；否则会把可播链误杀成播放失败。
+      if (st >= 300 && st < 400) return true;
+      if (st === 404 || st === 403) return false;
+      if (/text\/html/i.test(ct)) return false;
+      return true; // 5xx / 其他保守放行
+    } catch (e) { return true; } // 网络层异常 / 被 AbortController 中止：信任，不阻断播放
+  }
+
+  // 【v0.1.6 第一批】备用源竞速（单层版）：返回首个「已取得 url」的结果。
+  // 兼顾"采纳顺序"与"低延迟"：靠前者在 preferMs 优先窗口内出链则优先采纳；窗口结束后靠前者仍无果，
+  // 立即采纳最快出链者，避免被单个慢源拖住（原「串行 await 定序」的最坏隐患）。
+  // 【v0.1.6 第四~六批】实现已收敛为 raceTiered 的单层特例（单一 priority 组），避免两份重复逻辑。
+  function raceFirstUrl(promises, preferMs) {
+    return raceTiered([promises], preferMs);
+  }
+
+  // ---------- 播放链缓存 + 预取（【v0.1.6 第二批】） ----------
+  // 目标：重复播放 0ms 命中；搜索/歌单详情返回后预取前 3 首 → 首播（已预取）0ms 命中。
+  // QQ 链接有时效性，5 分钟为保守 TTL；key = id + quality（不同音质分槽，避免串音质）。
+  var URL_CACHE_TTL = 5 * 60 * 1000;
+  var URL_CACHE_MAX = 100;
+  var PREFETCH_COUNT = 3;
+  var PREFETCH_STAGGER_MS = 250;   // 错峰启动，避免预取与用户首播抢带宽
+  var _urlCache = {};
+  function urlCacheKey(musicItem, quality) {
+    return String((musicItem && musicItem.id) || '') + '|' + String(quality || 'standard');
+  }
+  function urlCacheGet(musicItem, quality) {
+    var k = urlCacheKey(musicItem, quality), e = _urlCache[k];
+    if (!e) return null;
+    if (Date.now() - e.at > URL_CACHE_TTL) { delete _urlCache[k]; return null; }
+    return e.url;
+  }
+  function urlCacheSet(musicItem, quality, url) {
+    if (!url || !musicItem || !musicItem.id) return false;
+    _urlCache[urlCacheKey(musicItem, quality)] = { url: url, at: Date.now() };
+    var keys = Object.keys(_urlCache);
+    if (keys.length > URL_CACHE_MAX) {   // LRU：按写入时间淘汰最旧
+      keys.sort(function (x, y) { return _urlCache[x].at - _urlCache[y].at; });
+      for (var i = 0; i < keys.length - URL_CACHE_MAX; i++) delete _urlCache[keys[i]];
+    }
+    return true;
+  }
+  function urlCacheClear() {   // 清空（单测隔离 / 需要强制重取链时用）；原地删除以保持 _internal._urlCache 引用稳定
+    Object.keys(_urlCache).forEach(function (k) { delete _urlCache[k]; });
+    return true;
+  }
+  // 后台预取：列表返回后顺带预热前 N 首的播放链（fire-and-forget、错峰、失败静默）。
+  // 注意：**不 await**，避免拖慢 search / 歌单详情返回；命中缓存则跳过。
+  function prefetchTopTracks(list, quality) {
+    if (!list || !list.length) return;
+    list.slice(0, PREFETCH_COUNT).forEach(function (it, i) {
+      if (!it || !it.id || urlCacheGet(it, quality)) return;
+      var delay = i * PREFETCH_STAGGER_MS;
+      if (typeof setTimeout === 'function') setTimeout(function () { getMediaSource(it, quality).catch(function () {}); }, delay);
+    });
+  }
+
+  // 【v0.1.6 第四~六批】串行双查：**先全名、无有效候选再剥离名兜底**（船长指定的新音源检索口径）。
+  // 与并发版 dualTitleSearch 的分工：
+  //   · 并发并集版（dualTitleSearch）用于 ②③④ 酷我系 HTML 站点——站点模糊排序且对并发限流不敏感，
+  //     两路并集才能把正确候选纳入池（实测并集 6/6 vs 单路 5/6）；
+  //   · 串行兜底版（本函数）用于 ⑤⑥⑦ 聚合 API 型源——单次检索已返回 20—30 条模糊候选，
+  //     且本插件同时挂 3 个这类源，若再并发双查即成倍放请求（3 源 × 2 路 = 6 路），故按序节省请求。
+  // 判定「有效」＝候选中存在通过 isGoodMatch（歌名+作者+时长）者；无有效候选才补查剥离名并合并（全名在前）。
+  async function dualTitleSearchSeq(searchFn, musicItem, signal) {
+    var full = String((musicItem && musicItem.title) || '').trim();
+    if (!full) return { items: [], kw: '', error: null };
+    var stripped = stripBracketed(full);
+    function safe(kw) {
+      return Promise.resolve().then(function () { return searchFn(kw, signal); })
+        .then(function (r) { return { items: r || [], error: null }; },
+              function (e) { return { items: [], error: e || null }; });
+    }
+    var first = await safe(full);
+    var hitFirst = first.items.some(function (c) { return isGoodMatch(c, musicItem); });
+    if (hitFirst || !stripped || stripped === full) {
+      return { items: first.items, kw: full, error: first.items.length ? null : first.error };
+    }
+    var second = await safe(stripped);
+    if (!second.items.length) {
+      return { items: first.items, kw: full, error: first.items.length ? null : (first.error || second.error) };
+    }
+    // 合并（全名路在前）并按 id+title 去重
+    var out = [], seen = {};
+    [first.items, second.items].forEach(function (arr) {
+      arr.forEach(function (it) {
+        var k = String((it && it.id) || '') + '|' + String((it && it.title) || '');
+        if (seen[k]) return;
+        seen[k] = 1; out.push(it);
+      });
+    });
+    return { items: out, kw: first.items.length ? full : stripped, error: null };
+  }
+
+  // 【v0.1.6 第四~六批】分层竞速：groups[0] 为高优先组（在 tierMs 窗口内独占出线权），
+  // 窗口结束后任意组「首出即用」，避免高优先组全挂时被拖满整个超时。
+  // 【v0.1.6 第七批】新增「高优先组全军落空即提前解禁」（tierDead）：高优先组已不可能出线时立即放行低优先组，
+  // 不再空等满窗口（实测出线耗时 1210ms → 约 600ms）；顺序语义不变。
+  // 与 raceFirstUrl 的区别：raceFirstUrl 只在「同一层内」按数组次序软优先；本函数支持跨层优先级。
+  // 所有 promise 均在 t=0 并发启动（保持「总耗时 = 单层 worst-case」的既有架构，不引入串行等待）。
+  function raceTiered(groups, tierMs) {
+    return new Promise(function (resolve) {
+      var flat = [], state = [], settled = 0, done = false, highOnly = tierMs > 0;
+      groups.forEach(function (g, gi) {
+        (g || []).forEach(function (p) { flat.push({ p: p, g: gi }); });
+      });
+      var n = flat.length;
+      if (!n) { resolve(null); return; }
+      function scan(priority) {
+        for (var i = 0; i < n; i++) {
+          if (state[i] && state[i].url) {
+            if (priority && flat[i].g !== 0) continue;      // 窗口内跳过低优先组的结果
+            done = true; resolve(state[i].url); return true;
+          }
+          // 窗口内：更靠前者仍未定 → 继续等（这就是「软优先」，否则先回的低优先源会抢跑）
+          if (priority && state[i] === undefined) return false;
+        }
+        return false;
+      }
+      // 【v0.1.6 第七批】高优先组是否已「全军落空」：组内全部已定且无一出链。
+      // 此时高优先组已不可能再出线，继续占着窗口纯属空等 → 立即解禁，让低优先组的结果马上上位。
+      // 真机实测收益：首选源取链失败时，出线耗时由「干等满 1200ms」降到「该组最后一方落定即出」
+      // （实测 1210ms → 约 600ms）。注意：只要高优先组**还有任何一方未定或已出链**，本判定恒为 false，
+      // 故不改变船长指定的验收顺序，只消除确定的空等。
+      function tierDead() {
+        for (var i = 0; i < n; i++) {
+          if (flat[i].g !== 0) continue;
+          if (state[i] === undefined) return false;   // 还有在途 → 有希望，继续等
+          if (state[i] && state[i].url) return false; // 已出链 → 交给 scan 正常出线
+        }
+        return true;
+      }
+      function onSettled() {
+        if (done) return;
+        if (settled === n || tierDead()) highOnly = false;  // 全部已定 或 高优先组已全军落空 → 解除优先级限制
+        if (scan(highOnly)) return;            // 窗口内仅认高优先组；窗口后/全定后任意组
+        if (settled === n) { done = true; resolve(null); }
+      }
+      flat.forEach(function (it, i) {
+        Promise.resolve(it.p).then(
+          function (r) { state[i] = (r && r.url) ? r : null; settled++; onSettled(); },
+          function () { state[i] = null; settled++; onSettled(); }
+        );
+      });
+      if (tierMs > 0) setTimeout(function () {
+        if (done) return;
+        highOnly = false;
+        scan(false);
+      }, tierMs);
+    });
+  }
+
+  // ---------- 备用源健康度（【v0.1.6 第七批】自适应排序） ----------
+  // 动机：任一家第三方站点都可能临时升级/限流/改版（实测 aax 会话偶发验证、GD 白名单收窄）。
+  //   若坏源仍占着「验收顺序」里的靠前位置，虽因竞速不至于拖满超时，却会白占 BK_TIER_MS 独占窗口，
+  //   把本该由健康源（如 MyFreeMP3）承担的出线权浪费掉。
+  // 做法：进程内为每个备用源记「连续失败数」，**连续失败 ≥ BK_FAIL_THRESHOLD 才在组内临时降权**，
+  //   只要成功一次立刻复位；健康时组内次序与船长指定的验收顺序逐位一致（首轮无历史 → 全 0 分 → 原序）。
+  // 边界：health 仅作用于「同一优先组内部」的软优先次序，**不跨组**、不新增/减少源、不改超时。
+  var bkHealth = {};             // { key: { fail: n, ok: n, lastErr: '' } }
+  function bkMark(key, ok, err) {
+    var h = bkHealth[key] || (bkHealth[key] = { fail: 0, ok: 0, lastErr: '' });
+    if (ok) { h.fail = 0; h.ok++; }
+    else { h.fail++; h.lastErr = err ? String(err) : ''; }
+    return h;
+  }
+  function bkScoreOf(key) {      // 降权分：0=健康（保持原位），1=连败达阈值（沉底）
+    var h = bkHealth[key];
+    return (h && h.fail >= BK_FAIL_THRESHOLD) ? 1 : 0;
+  }
+  function bkSorted(pairs) {     // 排好序的 {key,p} 列表（稳定排序，供内部与单测读取次序）
+    return pairs.slice().sort(function (a, b) { return bkScoreOf(a.key) - bkScoreOf(b.key); });
+  }
+  function bkOrderGroup(pairs) { // 稳定排序：故障源沉底，健康源保原序
+    return bkSorted(pairs).map(function (x) { return x.p; });
+  }
+  function bkHealthSnapshot() {  // 只读快照（供诊断/测试）
+    var out = {};
+    Object.keys(bkHealth).forEach(function (k) { out[k] = { fail: bkHealth[k].fail, ok: bkHealth[k].ok, lastErr: bkHealth[k].lastErr }; });
+    return out;
+  }
+  function bkHealthReset() {     // 清空（单测隔离用）；原地删除以保持引用稳定
+    Object.keys(bkHealth).forEach(function (k) { delete bkHealth[k]; });
+    return true;
+  }
+
+  // ---------- 取链（官方优先 + ②/③/④ 并发竞速 + 9s 软上限） ----------
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
-  async function qqOfficialGetUrl(mid) {
-    var uin = getUinFromCookie();
-    var filename = 'M500' + mid + mid + '.mp3'; // 高码率；C400 + .m4a 为普通码率
+  // 与官方 maotoumao/MusicFreePlugins qq.js 的 getSourceUrl 逐字节对齐的“质量→文件前缀”映射
+  var QQ_TYPE_MAP = {
+    m4a:      { s: 'C400', e: '.m4a' },
+    '128':    { s: 'M500', e: '.mp3' },
+    standard: { s: 'M500', e: '.mp3' },
+    low:      { s: 'M500', e: '.mp3' },
+    '320':    { s: 'M800', e: '.mp3' },
+    high:     { s: 'M800', e: '.mp3' },
+    super:    { s: 'F000', e: '.flac' }, // 【v0.1.0】补齐无损：
+    flac:     { s: 'F000', e: '.flac' },
+  };
+  // 官方 QQ 取链（免费曲返回完整链；VIP/试听曲官方不给链）
+  // 关键：vkey 请求必须与官方逐字节对齐——uin 用空串、guid 随机、filename 为「前缀+mid+mid+后缀」
+  // （官方即把 id 拼两次）、comm 含 authst:''。此前我方用 uin='0'/固定 guid/单 id 文件名，导致返回的
+  // vkey 与 CDN 实际文件 src 不匹配 → CDN 回 403/HTML → 原生播放器崩溃。这恰是前面 5 次修复
+  // （cheerio/http/headers/songmid/safeUrl）全部漏掉、且每次都复现的真正根因。
+  async function qqOfficialGetUrl(mid, quality, signal) {
+    var typeKey = (quality === 'high' || quality === '320' || quality === 'flac' || quality === 'super') ? '320'
+                : (quality === 'low' || quality === 'm4a') ? 'm4a'
+                : '128';
+    var typeObj = QQ_TYPE_MAP[typeKey] || QQ_TYPE_MAP['128'];
+    var uin = '';                                       // 与官方一致：空串（不是 '0'）
+    var guid = (Math.random() * 10000000).toFixed(0);   // 与官方一致：随机 guid
+    var mediaId = mid;
+    var file = typeObj.s + mid + mediaId + typeObj.e;    // 与官方一致：id 拼两次
     var data = {
       req_0: {
         module: 'vkey.GetVkeyServer',
         method: 'CgiGetVkey',
-        param: { filename: [filename], guid: '2796982635', songmid: [mid], songtype: [0], uin: uin, loginflag: 1, platform: '20' },
+        param: {
+          filename: [file],
+          guid: guid,
+          songmid: [mid],
+          songtype: [0],
+          uin: uin,
+          loginflag: 1,
+          platform: '20',
+        },
       },
-      comm: { uin: Number(uin), format: 'json', ct: 19, cv: 0 },
+      comm: { uin: uin, format: 'json', ct: 19, cv: 0, authst: '' },
     };
     var url = VKEY_API + '&loginUin=' + uin + '&data=' + encodeURIComponent(JSON.stringify(data));
-    var j = await req(url, { timeout: 12000 });
+    var j = await req(url, { timeout: OFFICIAL_TIMEOUT, signal: signal }); // 【v0.1.6】收紧至 3s，官方抢跑窗口内即出结果
     var sub = j && j.req_0 && j.req_0.data;
     if (!sub || (j.req_0.code && j.req_0.code !== 0)) {
       throw new Error('QQ 官方取链失败' + (j && j.req_0 && j.req_0.msg ? '：' + j.req_0.msg : ''));
@@ -441,58 +1257,316 @@
     if (!purl) {
       throw new Error('QQ 官方：该歌曲需登录态（Cookie 含 authst）才能取链，未登录无法播放');
     }
-    var sip = (sub.sip || []).filter(function (s) { return s && s.indexOf('http://ws') !== 0; });
-    var domain = sip[0] || (sub.sip && sub.sip[0]) || '';
+    // 与官方一致：优先取非 http://ws 开头的 sip，否则取首个；返回明文 http（不做 forceHttps）
+    var domain = (sub.sip || []).find(function (i) { return !i.startsWith('http://ws'); }) || (sub.sip && sub.sip[0]) || '';
     return domain + purl;
   }
   async function getMediaSource(musicItem, quality) {
-    var mid = String(musicItem.id || musicItem.songmid || '');
+    // 【v0.1.6 第二批】缓存命中即 0ms 返回（重复播放 / 预取命中），不再走任何网络。
+    var cachedUrl = urlCacheGet(musicItem, quality);
+    if (cachedUrl) return { url: cachedUrl };
+    // 【v0.1.4】只有 id/songmid 是合法 QQ songmid（14 位 base62）才走官方路径。
+    // 跨源曲（外源 id）过去会拿外源 id 去盲试官方接口，白等约 5s（实测 6893ms → 现在直接跳过，~2s 出链）。
+    var mid = qqSongMid(musicItem);
     var name = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
+    // 整段 9s 软上限：沙箱方法级 10s 硬超时，留 1s 余量；到点中止所有在途请求
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var signal = controller ? controller.signal : null;
+    var bestSoFar = null;   // 已通过【身份校验 + safeUrl 过滤】的次优链，供超时/全失败兜底
     var errs = [];
-    // 1) 官方 QQ 取链（免费曲完整链；VIP/未登录则失败进入兜底）
-    if (mid) {
-      try {
-        var official = await qqOfficialGetUrl(mid);
-        if (official) return { url: official, headers: { Referer: REFERER, 'User-Agent': CHROME_UA, 'Accept': '*/*' } };
-      } catch (e) { errs.push('QQ官方:' + e.message); }
+    function onMatch(u) { if (u && !bestSoFar) bestSoFar = u; }
+    // 【v0.1.6 第七批】健康度埋点：任一备用源 Promise 成功即 +ok 复位连败、失败即 +fail（供组内自适应排序）
+    // ⚠️ 关键：出线源确定后 finish() 会 abort 在途请求，由此抛出的「已取消(AbortError)」**不是源自身故障**。
+    //    真机实测：一次成功取链就会让其余 3 个未出线源各记 fail=1（lastErr 均为 "This operation was aborted"），
+    //    照此累计会把健康源误判为故障源→错误降权。故凡 signal 已被我方 abort 者一律【中性跳过】（不加不减）。
+    function srcTrack(key, p) {
+      return Promise.resolve(p).then(
+        function (r) { bkMark(key, true); return r; },
+        function (e) {
+          var selfCancelled = !!(signal && signal.aborted) || /abort/i.test((e && e.name) || '') || /abort/i.test((e && e.message) || '');
+          if (!selfCancelled) bkMark(key, false, e && e.message);
+          throw e;
+        }
+      );
     }
-    // 2) 首选备用：无名音乐网 mvmp3（自动过人机验证）
+    var deadline = controller ? setTimeout(function () { try { controller.abort(); } catch (e) {} }, 9000) : null;
+    function finish(r) {
+      if (deadline) clearTimeout(deadline);
+      if (controller) { try { controller.abort(); } catch (e) {} }
+      if (r && r.url) { try { urlCacheSet(musicItem, quality, r.url); } catch (e) {} } // 【v0.1.6 第二批】成功链入缓存（TTL 5min）
+      return r;
+    }
     try {
-      var mv = await mvGetMediaSource(musicItem);
-      if (mv && mv.url) return { url: mv.url }; // 不带 Referer（否则 CDN 403）
-    } catch (e) { errs.push('mvmp3:' + e.message); }
-    // 3) 次选备用：Tonzhon 网易云匹配（tonzhon 搜索发现 + 网易云 weapi 取链）
-    try {
-      var tz = await getNeteaseUrlForQuery((musicItem.title || '').trim(), (musicItem.artist || '').trim());
-      if (tz) return { url: forceHttps(tz) };
-    } catch (e) { errs.push('Tonzhon:' + e.message); }
-    throw new Error('《' + name + '》QQ官方取链失败，且备用音源（mvmp3 / Tonzhon）均未取得：' + (errs.join('；') || '未知原因') +
-      '。若 mvmp3 提示“验证失败”多为临时升级，稍后重试即可；Tonzhon 对极冷门曲也可能无匹配。');
+      // ① 官方 QQ 快路径（优先，包装为可能 null 的 Promise，不影响并发）
+      var offP = (mid ? qqOfficialGetUrl(mid, quality, signal) : Promise.resolve(null))
+        .then(function (official) {
+          var u = official ? safeUrl(official) : null;
+          if (!u) return null;
+          return validatePlayable(u, signal).then(function (ok) { return ok ? { url: u } : null; });
+        })
+        .catch(function () { return null; });
+      // ⑤ 高优先备用：音乐搜索神器（music.lmb520.cn，跨平台聚合；实测 netease/kuwo/kugou 可取链）
+      var sqP = srcTrack('sq', apiSourceGetMediaSource(SQ_SRC, musicItem, quality, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('sq:' + (e && e.message)); return null; });
+      // ⑥ 高优先备用：GD音乐台（music-api.gdstudio.xyz，实测仅 netease/joox 两个 source 可用）
+      var gdP = srcTrack('gd', apiSourceGetMediaSource(GD_SRC, musicItem, quality, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('gd:' + (e && e.message)); return null; });
+      // ⑦ 高优先备用：MyFreeMP3（mp3.zaodoc.com → www.puduoduo.top 的 kk_music 接口，含毫秒时长）
+      var myfP = srcTrack('myf', apiSourceGetMediaSource(MYF_SRC, musicItem, quality, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('myf:' + (e && e.message)); return null; });
+      // ② 备用 aax.cx（AAX音乐网，并发）——条目自带 playtime，可做【歌名+作者+时长】三重校验，最严
+      var aaxP = srcTrack('aax', siteGetMediaSource(AAX, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('aax:' + (e && e.message)); return null; });
+      // ③ 备用 mvmp3（无名音乐网，并发）——按「歌手 - 歌名」严格匹配歌名+作者
+      var mvP = srcTrack('mvmp3', mvGetMediaSource(musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('mvmp3:' + (e && e.message)); return null; });
+      // ④ 末选备用 qeecc.com（无忧音乐网，并发）
+      var qeP = srcTrack('qeecc', siteGetMediaSource(QEECC, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('qeecc:' + (e && e.message)); return null; });
+
+      // ① 官方抢跑窗口（【v0.1.6 第一批】7000→3000）：窗口内官方出链则用官方；超时立即让位备用源，不再干等。
+      var off = await Promise.race([offP, new Promise(function (res) { setTimeout(res, OFFICIAL_GRACE_MS); })]);
+      if (off && off.url) return finish({ url: off.url });
+
+      // ⑤⑥⑦ 与 ②③④ 全部在 t=0 并发启动（总耗时 = 单层 worst-case，非各层之和）。
+      // 【v0.1.6 第四~六批】改为【分层竞速】：高优先组（音乐搜索神器 → GD音乐台 → MyFreeMP3）在
+      // BK_TIER_MS 窗口内独占出线权（组内按数组次序软优先）；窗口结束或被全部否决后，全 6 源首出即用。
+      // 这样既落实船长指定的验收顺序，又不会被任一慢源拖满超时。
+      // 【v0.1.6 第七批】组内次序改为「健康度自适应」：bkOrderGroup 在**全部健康**时返回原序（逐位等于
+      // 验收顺序），仅把连续失败 ≥ 阈值的源沉到该组末位，使其不再白占出线窗口；成功后立即复位。
+      var bk = await raceTiered([
+        bkOrderGroup([{ key: 'sq', p: sqP }, { key: 'gd', p: gdP }, { key: 'myf', p: myfP }]),
+        bkOrderGroup([{ key: 'aax', p: aaxP }, { key: 'mvmp3', p: mvP }, { key: 'qeecc', p: qeP }]),
+      ], BK_TIER_MS);
+      if (bk) return finish({ url: bk });
+      // 全部备用源皆败，但存在「已通过身份校验」的次优链（仅时长未知场景）→ 超时/失败前仍返回，最大化“有歌可播”
+      if (bestSoFar) return finish({ url: bestSoFar });
+      throw new Error('《' + name + '》官方取链失败，且备用音源（音乐搜索神器 / GD音乐台 / MyFreeMP3 / aax / mvmp3 / qeecc）均未取得：' + (errs.join('；') || '未知原因') +
+        '。备用源提示“验证失败”多为站点临时升级，稍后重试即可；极冷门曲多源均可能无匹配。');
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      if (controller) { try { controller.abort(); } catch (e) {} }
+    }
   }
 
-  // ---------- 歌词 ----------
+  // ===================== 歌词校验 / 清洗 / 缓存（【v0.1.4】） =====================
+  // 背景：v0.1.3 起取链有「官方 + aax/mvmp3/qeecc」四层兜底，而歌词只有 QQ 官方一条路，
+  //       导致"靠备用源才播得出"的曲（跨源歌单/收藏导入、外源 id、无 songmid）必然无歌词。
+  //       本段补齐歌词兜底所需的三项能力：①有效性判定 → ②站点歌词清洗 → ③单曲歌词缓存。
+  // 关键坑一：aax 对无版权曲会回吐**占位歌词** `[00:00.00]暂无歌词内容`——它带时间轴、看似合法；
+  // 关键坑二：mvmp3 的 lrc 首行带站点水印 `[00:00.00]无名音乐网 www.mvmp3.com` 且文本含 BOM。
+  // 故"含时间轴"不足以判定有效，必须叠加「占位词 + 站点水印」黑名单，否则会把占位当歌词显示。
+  var LRC_TIMESTAMP = /\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]/;
+  var LRC_TAG = /^\s*\[(ti|ar|al|by|offset|re|ve|length|kana):[^\]]*\]\s*$/i;
+  // 站点水印：真歌词行几乎不会包含域名/站点名，出现即判为水印并丢弃
+  var LRC_WATERMARK = /www\.|https?:\/\/|无名音乐网|mvmp3|AAX音乐网|aax\.|无忧音乐网|qeecc|酷我|kuwo|九酷|一听音乐/i;
+  // 占位歌词：整首去掉标签后仅剩这些词 → 视为"该曲无歌词"
+  var LRC_PLACEHOLDER = /^(?:暂无歌词(?:内容)?|暂无|无歌词|没有歌词|歌词不存在|该歌曲暂无歌词|此歌曲暂无歌词|纯音乐|请欣赏|暂无歌词请欣赏|.*没有填词的纯音乐.*|.*该歌曲为纯音乐.*)$/;
+  // 单曲歌词缓存：getMediaSource 取链成功时顺带写入（零额外请求）；LRU 上限 + TTL 双兜底
+  var LRC_CACHE_MAX = 50, LRC_CACHE_TTL = 30 * 60 * 1000;
+  // 反查软上限：实测冷路径（站点会话握手 + 搜索 + 取链 + 取 lrc）最坏约 5.7s，
+  // 故留到 8s（仍低于 MusicFree 方法级 10s 硬超时），避免站点稍慢就把已有的歌词丢掉。
+  var LRC_LOOKUP_TIMEOUT = 8000;
+  var _lrcCache = {};
+  // 取「真实歌词行」：既带时间轴，时间轴后又有文字（过掉空行/纯时间轴行/站点水印行）
+  function lrcLines(text) {
+    var out = [], arr = String(text || '').split(/\r?\n/);
+    for (var i = 0; i < arr.length; i++) {
+      var line = arr[i].replace(/^\uFEFF/, '').trim();
+      if (!line || LRC_TAG.test(line)) continue;
+      var t = line.match(LRC_TIMESTAMP);
+      if (!t) continue;
+      var body = line.replace(/^(?:\[[^\]]*\])+/, '').trim();
+      if (!body) continue;                       // [00:00.00] 后面没文字 → 不是歌词行
+      if (LRC_WATERMARK.test(body)) continue;    // 站点水印行 → 丢弃
+      out.push({ at: parseInt(t[1], 10) * 60 + parseInt(t[2], 10), text: body });
+    }
+    return out;
+  }
+  // 有效性判定：至少 1 条真实歌词行，且全部歌词拼起来不是占位词、内容不过短
+  function lrcLooksValid(text) {
+    var lines = lrcLines(text);
+    if (!lines.length) return false;
+    var joined = lines.map(function (l) { return l.text; }).join('');
+    if (LRC_PLACEHOLDER.test(joined)) return false;
+    return joined.replace(/\s/g, '').length >= 8;
+  }
+  // 清洗：去 BOM、统一换行、剔站点水印行（保留 [ti:]/[ar:] 等元信息与真实歌词行）
+  function cleanLrc(text) {
+    if (!text || typeof text !== 'string') return '';
+    var arr = String(text).split(/\r?\n/), out = [];
+    for (var i = 0; i < arr.length; i++) {
+      var line = arr[i].replace(/^\uFEFF/, '').trim();
+      if (!line) continue;
+      if (LRC_TAG.test(line)) { out.push(line); continue; }
+      var body = line.replace(/^(?:\[[^\]]*\])+/, '').trim();
+      if (body && LRC_WATERMARK.test(body)) continue;
+      out.push(line);
+    }
+    return out.join('\n');
+  }
+  // 两种载荷都兼容：aax 的 lrc 端点是 JSON 包 {"lrc":"…"}；mvmp3 直接给纯文本
+  function parseLrcPayload(data) {
+    if (!data) return '';
+    if (typeof data === 'object') return typeof data.lrc === 'string' ? data.lrc : '';
+    var s = String(data).trim();
+    if (s.charAt(0) === '{') {
+      try { var j = JSON.parse(s); if (j && typeof j.lrc === 'string') return j.lrc; } catch (e) { /* 非 JSON → 按纯文本处理 */ }
+    }
+    return s;
+  }
+  // QQ songmid 形态：14 位 base62（如 0039MnYb0qxYhV）。外源 id（netease_xxx / 纯数字 songid）不匹配，
+  // 用于避免"拿外源 id 去盲试官方接口"白等约 5s。匹配失败只是跳过官方路径，仍会走备用源与备用歌词。
+  var QQ_MID_RE = /^[0-9A-Za-z]{14}$/;
+  function qqSongMid(musicItem) {
+    var a = String((musicItem && musicItem.songmid) || ''), b = String((musicItem && musicItem.id) || '');
+    if (QQ_MID_RE.test(a)) return a;
+    if (QQ_MID_RE.test(b)) return b;
+    return '';
+  }
+  function lrcCacheKey(musicItem) {
+    var mid = qqSongMid(musicItem);
+    if (mid) return 'm:' + mid;
+    return 'q:' + norm(musicItem && musicItem.title) + '|' + norm(musicItem && musicItem.artist);
+  }
+  function lrcCacheGet(musicItem) {
+    var k = lrcCacheKey(musicItem), e = _lrcCache[k];
+    if (!e) return null;
+    if (Date.now() - e.at > LRC_CACHE_TTL) { delete _lrcCache[k]; return null; }
+    return e;
+  }
+  function lrcCacheSet(musicItem, lrc, trans) {
+    var clean = cleanLrc(parseLrcPayload(lrc));
+    if (!lrcLooksValid(clean)) return false;
+    _lrcCache[lrcCacheKey(musicItem)] = { lrc: clean, trans: trans || undefined, at: Date.now() };
+    var keys = Object.keys(_lrcCache);
+    if (keys.length > LRC_CACHE_MAX) {   // LRU：按写入时间淘汰最旧
+      keys.sort(function (x, y) { return _lrcCache[x].at - _lrcCache[y].at; });
+      for (var i = 0; i < keys.length - LRC_CACHE_MAX; i++) delete _lrcCache[keys[i]];
+    }
+    return true;
+  }
+
+  // ---------- 备用歌词反查（【v0.1.4】第③级） ----------
+  // 取 lrc 文件（aax 的 .lrc 端点，实测无需 Referer/Cookie）
+  async function fetchLrcUrl(url) {
+    if (!/^https?:\/\//i.test(String(url || ''))) return '';
+    var r = await axios.get(url, { headers: { 'User-Agent': SITE_UA }, timeout: SRC_TIMEOUT, validateStatus: function () { return true; } });
+    return (r && r.data) || '';
+  }
+  // 取链成功后【后台预取】该源歌词入缓存：fire-and-forget，失败静默（getLyric 第③级会再兜一次）。
+  // 注意：此处刻意【不传 signal】—— 取链成功即 abort 主流程，带 signal 会被立刻中断。
+  function prefetchSiteLrc(url, musicItem) {
+    fetchLrcUrl(url).then(function (raw) {
+      lrcCacheSet(musicItem, parseLrcPayload(raw));
+    }).catch(function () {});
+  }
+  // 候选挑选：优先通过 isGoodMatch（歌名+作者+时长）者，否则按相关度退化；只取前 2 条控延迟
+  function lrcPickCandidates(items, musicItem) {
+    var all = items || [];
+    var matched = all.filter(function (c) { return isGoodMatch(c, musicItem); });
+    return (matched.length ? matched : all).slice()
+      .sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); })
+      .slice(0, 2);
+  }
+  // mvmp3 反查：取链接口【内联】返回 lrc，零额外请求
+  async function lrcFromMv(musicItem, kw) {
+    var cookie = await ensureMvCookie(false);
+    var cands = lrcPickCandidates(await mvSearch(kw, cookie), musicItem);
+    for (var i = 0; i < cands.length; i++) {
+      var d = await mvPlayUrl(cands[i].id, cookie);
+      var lrc = cleanLrc(d && d.lrc);
+      if (lrcLooksValid(lrc)) return { lrc: lrc, src: 'mvmp3' };
+    }
+    return null;
+  }
+  // aax 反查：取链接口的 lrc 是 URL，需再取一次并解 JSON 包
+  async function lrcFromAax(musicItem, kw) {
+    var cookie = await siteEnsureCookie(AAX.base);
+    var cands = lrcPickCandidates(await siteSearch(AAX, kw, cookie), musicItem);
+    for (var i = 0; i < cands.length; i++) {
+      var d = await sitePlayUrl(AAX, cands[i].id, cookie);
+      if (!(d && d.lrc)) continue;
+      var lrc = cleanLrc(parseLrcPayload(await fetchLrcUrl(d.lrc)));
+      if (lrcLooksValid(lrc)) return { lrc: lrc, src: 'aax' };
+    }
+    return null;
+  }
+  // 第③级入口：mvmp3 与 aax【并发】取首个"身份可信且歌词有效"的结果（用户指定并发策略），6s 软上限
+  async function lrcReverseLookup(musicItem) {
+    var kw = ((musicItem && musicItem.title) || '').trim() || ((musicItem && musicItem.artist) || '').trim();
+    if (!kw) return null;
+    function need(p) {
+      return p.then(function (r) { if (r && r.lrc) return r; throw new Error('无有效歌词'); });
+    }
+    var any = Promise.any([need(lrcFromMv(musicItem, kw)), need(lrcFromAax(musicItem, kw))]);
+    var tid = null;
+    var guard = new Promise(function (_, rej) { tid = setTimeout(function () { rej(new Error('歌词反查超时')); }, LRC_LOOKUP_TIMEOUT); });
+    try { return await Promise.race([any, guard]); }
+    catch (e) { return null; }
+    finally { if (tid) clearTimeout(tid); }
+  }
+
+  // ---------- 歌词（【v0.1.4】三级链：① QQ 官方 → ② 播放源缓存 → ③ 备用源反查） ----------
+  // 修复点：原实现只有官方一条路，凡"靠备用源才播得出"的曲必然无歌词（实测跨源曲 100% 复现）。
+  //   ① 官方：先做 songmid 形态校验（避免拿外源 id 盲试白等 ~5s）；返回后必须过 lrcLooksValid，
+  //      否则（如无版权曲 retcode=-1901 空歌词）继续下一级——这是"取不到歌词却无报错"的直接原因。
+  //   ② 缓存：getMediaSource 取链成功时已顺带写入（零额外请求），且天然与【实际播放的音源】同源同轴。
+  //   ③ 反查：按【歌名 + 歌手】在 mvmp3 / aax 并发检索，复用 isGoodMatch 防张冠李戴。
+  //   全部失败返回 {rawLrc:''}：不抛错、不阻塞播放，与原契约一致。
+  function maybeB64(s) {
+    if (!s) return '';
+    var str = String(s);
+    return looksBase64(str) ? b64Decode(str) : str;
+  }
   async function getLyric(musicItem) {
-    var mid = String(musicItem.id || musicItem.songmid || '');
-    if (!mid) return { rawLrc: '', translation: undefined };
-    var r = await req(LYRIC_API, {
-      params: {
-        songmid: mid, g_tk: 5381, loginUin: 0, hostUin: 0, format: 'jsonp',
-        inCharset: 'utf8', outCharset: 'utf-8', notice: 0, platform: 'yqq.json',
-        needNewCode: 0, nobase64: 0, musicid: 0, callback: 'callback',
-      },
-    });
-    var d = toObj(r);
-    var raw = d.lyric || '';
-    var trans = d.trans || '';
-    // nobase64=0 返回 base64；若后端直接返回纯文本则直接用
-    var rawLrc = looksBase64(raw) ? b64Decode(raw) : (raw || '');
-    var translation = trans ? (looksBase64(trans) ? b64Decode(trans) : trans) : undefined;
-    return { rawLrc: rawLrc, translation: translation };
+    var mid = qqSongMid(musicItem);
+    if (mid) {
+      try {
+        var r = await req(LYRIC_API, {
+          params: {
+            songmid: mid, g_tk: 5381, loginUin: 0, hostUin: 0, format: 'jsonp',
+            inCharset: 'utf8', outCharset: 'utf-8', notice: 0, platform: 'yqq.json',
+            needNewCode: 0, nobase64: 0, musicid: 0, callback: 'callback',
+          },
+        });
+        var d = toObj(r);
+        var trans = d.trans ? cleanLrc(maybeB64(d.trans)) : '';
+        var rawLrc = cleanLrc(maybeB64(d.lyric));
+        if (lrcLooksValid(rawLrc)) {
+          lrcCacheSet(musicItem, rawLrc, trans);   // 官方命中即入缓存，同曲后续零请求
+          return { rawLrc: rawLrc, translation: trans || undefined };
+        }
+      } catch (e) { /* 官方异常 → 继续备用歌词链 */ }
+    }
+    // ② 播放源缓存（getMediaSource 取链时已写入）
+    var hit = lrcCacheGet(musicItem);
+    if (hit) return { rawLrc: hit.lrc, translation: hit.trans };
+    // ③ 备用源反查
+    var found = await lrcReverseLookup(musicItem);
+    if (found) {
+      lrcCacheSet(musicItem, found.lrc);
+      return { rawLrc: found.lrc, translation: undefined };
+    }
+    return { rawLrc: '', translation: undefined };
   }
 
   // ---------- 歌曲信息（封面等，无独立详情端点则透传） ----------
+  // 关键：必须返回「完整」曲目对象（与 toTrack 同构），artwork 绝不空串。
+  // MusicFree 在收藏歌曲 / 拉起播放前会调用 getMusicInfo 取完整信息并存入收藏歌单；
+  // 若只回 { artwork } 或回空串，收藏歌单里每一首都会带 artwork:'' → 播放时交给原生层 → 闪退。
+  // 故此处把 artwork 兜底补全为真实封面 URL 或 undefined。
   async function getMusicInfo(musicItem) {
-    return { artwork: musicItem.artwork };
+    var am = musicItem.albummid || '';
+    var art = musicItem.artwork;
+    if (!art || art === '') art = toArtworkFromAlbumMid(am);
+    return Object.assign({}, musicItem, { artwork: art });
   }
 
   // ---------- 排行榜 ----------
@@ -505,7 +1579,7 @@
         id: String(t.id),
         title: t.topTitle || t.name || t.title || ('榜单' + t.id),
         description: t.description || t.intro || '',
-        coverImg: fixImg(t.picUrl || t.pic),
+        artwork: fixImg(t.picUrl || t.pic), // 【v0.1.0 修复】协议字段为 artwork（非 coverImg），否则排行榜封面不渲染
         playCount: t.listenCount || t.listennum,
       };
     });
@@ -604,6 +1678,7 @@
     var cd = d.cdlist[0];
     var tracks = cd.songlist || [];
     var musicList = tracks.map(toTrack).filter(Boolean);
+    prefetchTopTracks(musicList, 'standard'); // 【v0.1.6 第二批】歌单详情就绪即预取前 3 首播放链（不 await）
     return {
       isEnd: true,
       musicList: musicList,
@@ -616,26 +1691,58 @@
     };
   }
 
+  // ===================== 备用源会话后台预热（【v0.1.0】起，v0.1.4 扩展到三源） =====================
+  // 三个备用源同为「酷我系 CMS」，人机验证握手约 2—4s。若等到真正要用时才握手，这笔开销会压在
+  // 首次取链或首次歌词反查上（实测冷路径最坏 7.1s，逼近反查软上限）。故在插件加载后延迟预热 +
+  // 周期续期（< 50min TTL），并随 search 调用顺手预热，使用时直接命中热会话。
+  function warmMvCookie() { ensureMvCookie(false).catch(function () {}); }
+  // 【v0.1.4】aax / qeecc 会话一并预热：歌词反查（走 aax）与末选备用取链（走 qeecc）同时受益，
+  // 歌词冷路径由 2—7s 降至 2.2—3.6s（站点会话有效约 50 分钟，故 40 分钟续期一次）。
+  function warmSiteCookie(cfg) { return siteEnsureCookie(cfg.base).catch(function () {}); }
+  function warmAllCookies() {
+    warmMvCookie();
+    warmSiteCookie(AAX);
+    warmSiteCookie(QEECC);
+  }
+  if (typeof setTimeout === 'function') {
+    setTimeout(warmAllCookies, 4000);
+    if (typeof setInterval === 'function') setInterval(warmAllCookies, 40 * 60 * 1000);
+  }
+
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.0.1',
+    version: '0.1.6',
     author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
+      '【v0.1.6 取链提速】官方抢跑窗口 7s→3s、各源超时统一收紧至 3s；' +
+      '【v0.1.6 播放链缓存+预取】同一首歌二次播放 0ms 命中（TTL 5 分钟、LRU 100 条、按音质分槽），搜索/歌单详情返回后自动预热前 3 首；' +
+      '【v0.1.6 新增三个备用源】音乐搜索神器(music.lmb520.cn)、GD音乐台(music-api.gdstudio.xyz)、MyFreeMP3(mp3.zaodoc.com → www.puduoduo.top) 均为免登录聚合 API，与②③④一并【首出即用】竞速（高优先组 ⑤⑥⑦ 独占 1.2s 窗口，之后全 6 源首出即用）；' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
-      '播放取链三层兜底：①官方QQ(CgiGetVkey，需登录Cookie解锁) → ②首选备用 无名音乐网mvmp3(自动过人机验证) → ③次选备用 Tonzhon网易云匹配(tonzhon.com搜索+weapi取链，覆盖QQ的VIP/试听失效曲)。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qq/qq.js',
+      '播放取链【v0.1.6 共 7 层兜底】：①官方QQ(CgiGetVkey，需登录Cookie解锁) 优先(≤3s)，' +
+      '②音乐搜索神器 ③GD音乐台 ④MyFreeMP3 ⑤AAX音乐网 aax.cx ⑥无名音乐网 mvmp3 ⑦无忧音乐网 qeecc.com 全部并发启动；' +
+      '采纳顺序（用户指定验收顺序）：官方 → 音乐搜索神器 → GD音乐台 → MyFreeMP3 → aax → mvmp3 → qeecc；' +
+      'aax 条目自带时长、做歌名+作者+时长三重校验最严，mvmp3 按「歌手 - 歌名」做歌名+作者+时长校验，其余源同样走歌名/作者/时长多重身份校验；' +
+      '②③④（HTML 站点）的检索走【全名/剥离注解】并发双查并集，⑤⑥⑦（聚合 API）走先全名、剥离名兜底的串行双查；' +
+      '②③④ 的人机验证均由插件自动完成（与 mvmp3 同构的 CSRF 会话方案）并缓存 50 分钟，无需手动操作；' +
+      '整段 9s 软上限 + 歌名/作者/时长多重身份校验，最大化“有歌可播”且规避沙箱 10s 超时。' +
+      '【v0.1.5 优化】备用音源检索剥离歌名括号注解（如「阴天（Live）」→「阴天」），仅作用于回退备用音源、作者保持不变，提升官网无版权曲回退 aax/mvmp3/qeecc 备用源的命中率；' +
+      '【v0.1.4 歌词三级兜底】取链有四层兜底而歌词原先只有官方一条路，导致“靠备用源才播得出”的曲必然无歌词；' +
+      '现改为 ①QQ官方歌词（须过时长/占位校验，无版权曲 retcode=-1901 空歌词不再当成功）→ ②取链时顺带缓存的该源歌词（零额外请求、与播放音源同源同轴）→ ③按【歌名+歌手】在 mvmp3/aax 并发反查；' +
+      '并过滤站点占位歌词（如“暂无歌词内容”）与水印行；同时修正非 QQ songmid 盲试官方取链白等约 5s 的问题；' +
+      '三个备用源（mvmp3 / aax / qeecc）的会话均已在插件加载与搜索时后台预热并 40 分钟续期，歌词冷路径由 2—7s 降至 2.2—3.6s。',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.6/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
       {
         key: 'cookie',
         name: 'Cookie（可选）',
-        hint: 'QQ 音乐登录后的会话 Cookie。填入后用于解锁「①官方QQ取链」（需含 authst / uin）；搜索、歌词、排行榜、热门歌单、歌单导入通常无需 Cookie。未填也能播——会自动走 mvmp3 / Tonzhon 备用音源。',
+        hint: 'QQ 音乐登录后的会话 Cookie。填入后用于解锁「①官方QQ取链」（需含 authst / uin）；搜索、歌词、排行榜、热门歌单、歌单导入通常无需 Cookie。未填也能播——会自动走 aax / mvmp3 / qeecc 备用音源。',
       },
       {
         key: 'mvmp3_cookie',
         name: 'mvmp3 Cookie（可选）',
-        hint: '无名音乐网(mvmp3)的人机验证由插件自动完成，无需你手动操作；会话约 50 分钟自动刷新一次。若自动过验证偶发失败，可在此填 mvmp3 的 PHPSESSID（站点 https://www.mvmp3.com 登录/F12 取 Cookie）以跳过自动验证。',
+        hint: '无名音乐网(mvmp3)的人机验证由插件自动完成并后台预热，无需你手动操作；会话约 50 分钟自动续期一次。若自动过验证偶发失败，可在此填 mvmp3 的 PHPSESSID（站点 https://www.mvmp3.com 登录/F12 取 Cookie）以跳过自动验证。AAX音乐网(aax.cx) 与 无忧音乐网(qeecc.com) 的人机验证同样由插件自动完成，无需任何配置。',
       },
     ],
     hints: {
@@ -655,5 +1762,89 @@
     getRecommendSheetsByTag: getRecommendSheetsByTag,
     importMusicSheet: importMusicSheet,
     getMusicSheetInfo: getMusicSheetInfo,
+    getRecommendSheetDetail: getMusicSheetInfo, // 别名：部分版本 MusicFree 用此名拉取推荐/热门歌单详情
+    // _internal：仅供单元测试访问纯函数（isGoodMatch/多重身份校验、safeUrl、JSONP 剥离、base64 解码等）
+    _internal: {
+      isGoodMatch: isGoodMatch,
+      matchScore: matchScore,
+      artistMatch: artistMatch,               // 【v0.1.6 第三批】作者匹配（多歌手切分/分隔符）
+      dualTitleSearch: dualTitleSearch,       // 【v0.1.6 第三批】全名 / 剥离注解 双查询竞速
+      DUAL_TRUST_HOLD_MS: DUAL_TRUST_HOLD_MS,
+      norm: norm,
+      stripBracketed: stripBracketed,         // 【备用音源检索优化】剥离歌名括号注解
+      backupQueryTitle: backupQueryTitle,     // 【备用音源检索优化】仅剥离歌名、作者不变
+      durMatch: durMatch,
+      mvParseItems: mvParseItems,
+      aaxParseItems: aaxParseItems,   // 【v0.1.3】aax.cx 条目解析（含时长）
+      qeParseItems: qeParseItems,     // 【v0.1.3】qeecc.com 条目解析（歌手《歌名》[MP3]）
+      splitDashTitle: splitDashTitle, // 【v0.1.3】「歌手 - 歌名」+「MM:SS」拆分
+      mvIsVerify: mvIsVerify,
+      siteIsVerify: siteIsVerify,     // 【v0.1.3】站点人机验证页判定
+      validatePlayable: validatePlayable, // 【v0.1.3】可播放性探测（含 3xx 信任分支）
+      raceFirstUrl: raceFirstUrl,         // 【v0.1.6】备用源首出即用竞速（软优先 aax→mvmp3→qeecc）
+      // 【v0.1.6 第二批】播放链缓存 + 预取（仅供单测访问；真机由 getMediaSource/search 内部调用）
+      urlCacheGet: urlCacheGet,
+      urlCacheSet: urlCacheSet,
+      urlCacheClear: urlCacheClear,
+      urlCacheKey: urlCacheKey,
+      prefetchTopTracks: prefetchTopTracks,
+      _urlCache: _urlCache,
+      // 【v0.1.3】三源单体入口：便于真机逐源诊断（哪个源挂了能一眼定位，不必跑整段竞速）
+      AAX: AAX,
+      QEECC: QEECC,
+      siteGetMediaSource: siteGetMediaSource,
+      mvGetMediaSource: mvGetMediaSource,
+      // 【v0.1.6 第三批】站点搜索层单测/诊断入口：可直接对比「全名 vs 剥离名」两条检索词的召回差异
+      mvSearch: mvSearch,
+      siteSearch: siteSearch,
+      ensureMvCookie: ensureMvCookie,
+      siteEnsureCookie: siteEnsureCookie,
+      // 【v0.1.6 第四~六批】聚合 API 型备用源（音乐搜索神器 ⑤ / GD音乐台 ⑥ / MyFreeMP3 ⑦）
+      SQ_SRC: SQ_SRC, GD_SRC: GD_SRC, MYF_SRC: MYF_SRC,
+      sqSearch: sqSearch, sqGetUrl: sqGetUrl, sqParseItems: sqParseItems,
+      gdSearch: gdSearch, gdGetUrl: gdGetUrl, gdParseItems: gdParseItems, gdBrOf: gdBrOf,
+      myfSearch: myfSearch, myfGetUrl: myfGetUrl,
+      apiSourceGetMediaSource: apiSourceGetMediaSource,
+      dualTitleSearchSeq: dualTitleSearchSeq,   // 【第四~六批】串行双查（先全名、剥离兜底）
+      raceTiered: raceTiered,                   // 【第四~六批】分层竞速（高优先组独占窗口）
+      formBody: formBody, joinIfArray: joinIfArray, toMs: toMs,
+      BK_TIER_MS: BK_TIER_MS, API_CANDIDATES: API_CANDIDATES,
+      // 【v0.1.6 第七批】备用源健康度自适应排序（供单测隔离与真机诊断"哪个源被降权了"）
+      bkMark: bkMark,
+      bkScoreOf: bkScoreOf,
+      bkSorted: bkSorted,                       // 排序后的 {key,p} 列表（单测读键序）
+      bkOrderGroup: bkOrderGroup,
+      bkHealthSnapshot: bkHealthSnapshot,
+      bkHealthReset: bkHealthReset,
+      BK_FAIL_THRESHOLD: BK_FAIL_THRESHOLD,
+      safeUrl: safeUrl,
+      stripJsonp: stripJsonp,
+      b64Decode: b64Decode,
+      toArtworkFromAlbumMid: toArtworkFromAlbumMid,
+      fixImg: fixImg,
+      // 【v0.1.4】歌词链：校验/清洗/缓存/反查（便于单测与真机定位"歌词为什么没出来"）
+      lrcLines: lrcLines,
+      lrcLooksValid: lrcLooksValid,
+      cleanLrc: cleanLrc,
+      parseLrcPayload: parseLrcPayload,
+      qqSongMid: qqSongMid,
+      qqMidRe: QQ_MID_RE,
+      lrcCacheKey: lrcCacheKey,
+      lrcCacheGet: lrcCacheGet,
+      lrcCacheSet: lrcCacheSet,
+      lrcPickCandidates: lrcPickCandidates,
+      lrcFromMv: lrcFromMv,
+      lrcFromAax: lrcFromAax,
+      lrcReverseLookup: lrcReverseLookup,
+      fetchLrcUrl: fetchLrcUrl,
+      maybeB64: maybeB64,
+      // 测试钩子：清空会话与歌词缓存（仅供单测隔离用例状态，生产路径不调用）
+      _resetCaches: function () {
+        _mvCookie = null; _mvCookieAt = 0; _mvCookieUser = false;
+        _siteCookie = {};
+        _lrcCache = {};
+        bkHealthReset();      // 【v0.1.6 第七批】一并清空备用源健康度，保证单测用例互不串扰
+      },
+    },
   };
 })();
