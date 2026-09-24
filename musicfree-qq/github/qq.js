@@ -1,6 +1,6 @@
-// QQ音乐 v0.1.7 · 发布于 2026-09-23（MusicFree 音源插件发布版）
+// QQ音乐 v0.1.8 · 发布于 2026-09-23（MusicFree 音源插件发布版）
 // QQ音乐（腾讯系）音源插件
-// 平台：QQ音乐  author：tianpeng  version：0.1.7
+// 平台：QQ音乐  author：tianpeng  version：0.1.8
 //
 // 接口契约（经运行时真实联网探测 + 研读 jsososo/QQMusicApi 开源实现得出，全部免签端点）：
 //   搜索        GET  c.y.qq.com/soso/fcgi-bin/client_search_cp?aggr=1&cr=1&flag_qc=0&p=<page>&n=30&w=<kw>&format=json
@@ -117,6 +117,17 @@
 //       抛错拒绝错播，而非回退未过滤列表；
 //   实测（diag_e2e_last_summer.js 真机取链 + MP4 mvhd 时长解析）：连续 4 次取链均返回 245.16s＝4分05秒
 //     王大毛原版；⑤/⑦ 已正确拒绝全部不符候选并交还 ⑥/②/③/④ 出线。
+// ============ v0.1.8：校验口径调整为「歌名+作者」，取消时长校验（提速） ============
+//   背景：v0.1.7 为修「去年夏天-王大毛」跨端错播（移动端误取程响 2:53 翻唱版）引入了「歌名+作者+时长」三重校验。
+//     实测复盘发现：该首错播的根因是【歌手校验 fail-open】（旧实现 `if(!a||!b) return true` 对缺失歌手直接放行），
+//     而非时长维度缺失——程响与原版歌手不同（程响≠王大毛），只要歌手校验严格即可拦截，时长并非必要因子。
+//   调整：① isGoodMatch / isSafeCandidate / matchScore 三处移除 durState 参与；强命中与可安全池改以「歌名+作者」双因子判定；
+//     ② 零信息候选（歌手缺失）的拒收口径由「歌手与时长双空」收为「歌手缺失/不符」——目标带歌手时更干净；
+//     ③ 取链热路径不再做时长解析/比对，进一步缩短判定耗时；并发竞速与分层竞速（高优先组 ⑤⑥⑦ 独占窗口、窗口结束/全军落空后全 6 源首出即用）保持不变。
+//   权衡（须如实告知）：取消时长后，对「同歌手、不同录音时长」的版本（如某曲 studio 4:05 vs live 2:53）不再能按时长区分，
+//     可能取到非预期时长版本；但「异歌手翻唱」（如 去年夏天 程响 vs 王大毛）仍由歌手校验严格拦截，原核心 bug 不回归。
+//   并发与竞速：7 层（官方 + 6 备用源）全部 t=0 并发启动；高优先组（音乐搜索神器/GD音乐台/MyFreeMP3）在 BK_TIER_MS(1200ms)
+//     窗口内独占出线权，窗口结束或被全部否决后，低优先组（aax/mvmp3/qeecc）与高优先组剩余源「首出即用」，兼顾验收顺序与低延迟。
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
@@ -556,29 +567,28 @@
     if (!t || !ct) return false;
     return ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0;
   }
-  // 强命中：歌名互含 + 歌手与时长【均不与目标冲突】+ 其中【至少一侧已验证一致】。
-  // 「至少一侧已验证」是关键：既无歌手也无时长可验证的候选（翻唱、缺字段条目）不再算命中——
-  // 它们退入「可安全播放」池并靠后排序，不会被优先取链。
+  // 强命中：歌名互含 + 歌手【不与目标冲突】+ 歌手已验证一致（或目标本身无歌手时仅凭歌名）。
+  // 【v0.1.8】取消时长校验：时长多数备用源返回不可靠/缺失，且「歌名+歌手」已足以区分绝大多数异版
+  //   （实测 去年夏天：王大毛原版 vs 程响翻唱 歌手不同，歌手校验即可拦截，无需时长）；
+  //   移除时长可去掉取链热路径上的时长解析/比对开销，进一步提升取链速率。
   function isGoodMatch(cand, musicItem) {
     if (!titleOk(cand, musicItem)) return false;
-    var a = artistState(cand, musicItem), d = durState(cand, musicItem);
-    if (a === 'conflict' || d === 'conflict') return false;
-    var hasA = !!norm(musicItem && musicItem.artist), hasD = !!(musicItem && musicItem.duration);
-    if (!hasA && !hasD) return true;                 // 目标侧既无歌手也无时长 → 只能凭歌名
-    return (hasA && a === 'ok') || (hasD && d === 'ok');
+    var a = artistState(cand, musicItem);
+    if (a === 'conflict') return false;
+    var hasA = !!norm(musicItem && musicItem.artist);
+    if (!hasA) return true;                 // 目标侧无歌手 → 仅凭歌名
+    return a === 'ok';
   }
-  // 可安全播放（弱匹配兜底池）：歌名互含 + 歌手与时长均非【明确冲突】，且必须满足以下之一——
-  //   ① 至少一侧已验证一致（歌手 ok 或 时长 ok）；
-  //   ② 目标本身既无歌手也无时长（跨源导入曲）→ 无从校验，此时凭歌名放行即最优解。
-  // 【v0.1.7】关键收紧：目标带身份信息、而候选「歌手与时长双双为空」时，不再放行。
-  //   实测（去年夏天/王大毛）：⑤ 音乐搜索神器索引内无王大毛原版，唯一的零信息候选是
-  //   「去年夏天（男声版）(Cover: 家家)」——旧口径会把它当安全候选并优先取链，造成异版错播。
+  // 可安全播放（弱匹配兜底池）：歌名互含 + 歌手非【明确冲突】，且至少一侧已验证一致（歌手 ok）；
+  //   目标本身无歌手（跨源导入曲）→ 无从校验，凭歌名放行即最优解。
+  // 【v0.1.8】收紧零信息候选：目标带歌手、候选歌手缺失/不符 → 不再放行（杜绝翻唱/他人版本上位）；
+  //   同步取消时长兜底（v0.1.7 曾以「歌手与时长双空」拒收，现仅以歌手维度判定，逻辑更清晰且提速）。
   function isSafeCandidate(cand, musicItem) {
     if (!titleOk(cand, musicItem)) return false;
-    var a = artistState(cand, musicItem), d = durState(cand, musicItem);
-    if (a === 'conflict' || d === 'conflict') return false;
-    if (a === 'ok' || d === 'ok') return true;
-    return !norm(musicItem && musicItem.artist) && !(musicItem && musicItem.duration);
+    var a = artistState(cand, musicItem);
+    if (a === 'conflict') return false;
+    if (a === 'ok') return true;
+    return !norm(musicItem && musicItem.artist);
   }
   function matchScore(c, musicItem) {
     var t = norm(musicItem.title), ar = norm(musicItem.artist);
@@ -586,11 +596,6 @@
     if (t && (ct.indexOf(t) >= 0 || t.indexOf(ct) >= 0)) s += 2;
     if (artistMatch(ar, ca) && ar && ca) s += 1;                           // 作者口径与 isGoodMatch 对齐
     if (t && ct === t) s += 1;                                             // 歌名完全相等再加 1，压制「长尾包含」候选
-    // 【v0.1.7】时长维度纳入打分：已验证一致 +2；明确冲突重罚（此类同时被 isSafeCandidate 逐出，
-    //   此处扣分是双保险，防止将来单独复用 matchScore 时重新引入错播）。
-    var d = durState(c, musicItem);
-    if (d === 'ok') s += 2;
-    else if (d === 'conflict') s -= 5;
     return s;
   }
   // 【v0.1.7】统一选池：优先强命中；无强命中则退到「可安全播放」池；两者皆空 → 返回 null（调用方抛错拒绝错播）。
@@ -1784,10 +1789,10 @@
 
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.1.7',
+    version: '0.1.8',
     author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
-      '【v0.1.7 错播修复】强制「歌名+作者+时长」三重身份校验：无强命中不再回退未过滤列表（杜绝同名异版错播，如实测去年夏天-王大毛 移动端误取程响 2分53秒版），零信息翻唱候选不再上位，时长纳入打分；' +
+      '【v0.1.8 校验口径调整】备用源校验由「歌名+作者+时长」收为「歌名+作者」双因子，取消时长校验（时长多源返回不可靠/缺失），取链热路径不再比对时长、进一步提速；歌手校验仍严格（程响等异歌手翻唱一律拦截，去年夏天-王大毛 仍由作者校验命中原版）。' +
       '【v0.1.6 取链提速】官方抢跑窗口 7s→3s、各源超时统一收紧至 3s；' +
       '【v0.1.6 播放链缓存+预取】同一首歌二次播放 0ms 命中（TTL 5 分钟、LRU 100 条、按音质分槽），搜索/歌单详情返回后自动预热前 3 首；' +
       '【v0.1.6 新增三个备用源】音乐搜索神器(music.lmb520.cn)、GD音乐台(music-api.gdstudio.xyz)、MyFreeMP3(mp3.zaodoc.com → www.puduoduo.top) 均为免登录聚合 API，与②③④一并【首出即用】竞速（高优先组 ⑤⑥⑦ 独占 1.2s 窗口，之后全 6 源首出即用）；' +
@@ -1804,7 +1809,7 @@
       '现改为 ①QQ官方歌词（须过时长/占位校验，无版权曲 retcode=-1901 空歌词不再当成功）→ ②取链时顺带缓存的该源歌词（零额外请求、与播放音源同源同轴）→ ③按【歌名+歌手】在 mvmp3/aax 并发反查；' +
       '并过滤站点占位歌词（如“暂无歌词内容”）与水印行；同时修正非 QQ songmid 盲试官方取链白等约 5s 的问题；' +
       '三个备用源（mvmp3 / aax / qeecc）的会话均已在插件加载与搜索时后台预热并 40 分钟续期，歌词冷路径由 2—7s 降至 2.2—3.6s。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.7/musicfree-qq/qq.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.8/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
