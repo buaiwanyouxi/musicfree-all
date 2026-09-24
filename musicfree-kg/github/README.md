@@ -1,17 +1,23 @@
 # MusicFree 音源插件 - 酷狗音乐
 
 ## 简介
-酷狗音乐音源，官方直链取链 + 无名音乐网/歌曲宝双层备用。
+酷狗音乐音源，官方直链取链 + 无名音乐网/歌曲宝/AAX音乐网三层备用（共四层取链）；含三态身份校验防错播、官方取链软熔断、取链质量打分。
 
 ## 安装方式
 ### 方式一：订阅源安装（推荐）
 将以下 URL 添加到 MusicFree 订阅源：
-https://raw.githubusercontent.com/buaiwanyouxi/musicfree-all/main/musicfree-kg/github/kg.js
+https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.0/musicfree-kg/kg.js
 
 ### 方式二：本地安装
 下载 `kg.js` 文件，在 MusicFree 中手动导入。
 
 ## 更新日志
+### 0.1.0 (2026-09-24)
+- 下沉三态身份校验修复错播隐患（无安全候选拒绝错播）
+- 新增 AAX 音乐网第③备用源，取链层级扩展至四层
+- 酷狗官方取链软熔断（连续空返回 5 次跳过官方直走备用源）
+- 取链质量打分（歌名+歌手匹配择优 + 结构化日志）
+
 ### 0.0.9 (2026-09-23)
 - 发布版，包含完整插件逻辑（单文件、无外部依赖）
 - 支持搜索、播放、歌单等功能
