@@ -1,5 +1,5 @@
 // QQ音乐（腾讯系）音源插件
-// 平台：QQ音乐  author：tianpeng  version：0.1.8
+// 平台：QQ音乐  author：tianpeng  version：0.1.9
 //
 // 接口契约（经运行时真实联网探测 + 研读 jsososo/QQMusicApi 开源实现得出，全部免签端点）：
 //   搜索        GET  c.y.qq.com/soso/fcgi-bin/client_search_cp?aggr=1&cr=1&flag_qc=0&p=<page>&n=30&w=<kw>&format=json
@@ -127,6 +127,19 @@
 //     可能取到非预期时长版本；但「异歌手翻唱」（如 去年夏天 程响 vs 王大毛）仍由歌手校验严格拦截，原核心 bug 不回归。
 //   并发与竞速：7 层（官方 + 6 备用源）全部 t=0 并发启动；高优先组（音乐搜索神器/GD音乐台/MyFreeMP3）在 BK_TIER_MS(1200ms)
 //     窗口内独占出线权，窗口结束或被全部否决后，低优先组（aax/mvmp3/qeecc）与高优先组剩余源「首出即用」，兼顾验收顺序与低延迟。
+// ============ v0.1.9：解耦第 ⑤ 层双依赖（music.lmb520.cn 与 sq.js 同源） ============
+//   背景：第 ⑤ 层「音乐搜索神器」music.lmb520.cn 是 sq.js 音源插件的【唯一后端】——两者同源单点。
+//     一旦该后端失效，qq.js 的 6 个备用源里其实有 1 个并非独立冗余，形成「双依赖」单点故障。
+//   做法（Plan A，低成本）：将 ⑤ 移出高优先独占窗口、降为最后兜底（raceTiered 的【组 2】）；
+//     组 0 = GD音乐台 / MyFreeMP3（均独立于 sq，BK_TIER_MS 窗口内独占出线权）；
+//     组 1 = AAX音乐网 / 无名音乐网 / 无忧音乐网（均独立于 sq，窗口后首出即用）；
+//     组 2 = 音乐搜索神器（★非独立冗余★，仅前两组全败/全慢时兜底）。
+//   效果：真正独立的备用源 = 组0 + 组1 = 5 个（gd/myf/aax/mv/qe）。sq 失效时 qq.js 仍由这 5 个独立源承担取链，双依赖彻底解耦。
+//   取舍（如实告知）：当前 ⑤ 仍保留为最后兜底（未被移除），故「5 个独立源全挂、仅 sq 存活」时仍能出链；
+//     若需恢复「6 个真正独立备用源」，按 Plan B 将 ⑤ 替换为独立聚合网关（开发成本较高，本次未启用）。
+//   验收：模拟 sq 失效 → 5 个独立源任一可单独承担取链；5 独立源全开 → 出链来自独立源集合（不回退 sq）。
+//   配套【v0.1.9 健康度巡检】：每日首次取链前对 6 个备用域（gd/myf/aax/mvmp3/qeecc/sq）并发 HEAD 探活（超时 3s、非阻塞），
+//     提前把不可达源标记软熔断降权，并将结果写入 bkProbeSnapshot；被熔断源以 console.warn 每日提示一次，状态可通过 _internal 读取可视化。
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
@@ -1282,6 +1295,62 @@
     return true;
   }
 
+  // 【v0.1.9 健康度巡检】每日首播前对 6 个备用域做 HEAD 探活，将软熔断状态前置可视化
+  // 动机：原 bkHealth 仅在实际取链失败后才累计连败、降权；若某源当天已宕机，第一次播放仍会白等其窗口。
+  //   现于每日首次取链前并发 HEAD 探活 6 个备用域（超时 3s、非阻塞），提前把不可达源标记降权，
+  //   并将结果写入 bkProbeSnapshot 供可视化（调试/诊断面板可读）；不可达源在 getMediaSource 首播前即被 sink。
+  var bkProbeSnapshot = {};          // key -> { ok: bool|null, ts, err }
+  var lastHealthCheckDate = '';      // 当日已探活则跳过（每天仅探一次）
+  var BK_PROBE_TARGETS = [
+    { key: 'gd',    url: 'https://music-api.gdstudio.xyz/' },
+    { key: 'myf',   url: 'https://www.puduoduo.top/' },
+    { key: 'aax',   url: 'https://www.aax.cx/' },
+    { key: 'mvmp3', url: 'https://www.mvmp3.com/' },
+    { key: 'qeecc', url: 'https://www.qeecc.com/' },
+    { key: 'sq',    url: 'https://music.lmb520.cn/' },
+  ];
+  function todayStr() {
+    var d = new Date();
+    return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+  }
+  function probeOne(t) {
+    return new Promise(function (resolve) {
+      // 环境不支持 HEAD（如单测桩仅实现 get）→ 不探、不干扰 bkHealth
+      if (!axios || typeof axios.head !== 'function') {
+        bkProbeSnapshot[t.key] = { ok: null, ts: Date.now(), err: 'no-head-support' };
+        resolve();
+        return;
+      }
+      var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var sig = controller ? controller.signal : null;
+      var timer = controller ? setTimeout(function () { try { controller.abort(); } catch (e) {} }, 3000) : null;
+      // validateStatus 恒真：只要站点"响应"（含 4xx/5xx）即视为可达；仅网络错误/超时/中止判为不可达
+      axios.head(t.url, { timeout: 3000, signal: sig, headers: defaultHeaders(), validateStatus: function () { return true; } })
+        .then(function () {
+          if (timer) clearTimeout(timer);
+          bkMark(t.key, true);
+          bkProbeSnapshot[t.key] = { ok: true, ts: Date.now(), err: '' };
+        })
+        .catch(function (e) {
+          if (timer) clearTimeout(timer);
+          bkMark(t.key, false, 'health-probe');
+          bkProbeSnapshot[t.key] = { ok: false, ts: Date.now(), err: (e && e.message) || String(e) };
+        })
+        .then(resolve, resolve);
+    });
+  }
+  async function probeBackupHealth() {
+    var today = todayStr();
+    if (lastHealthCheckDate === today) return;   // 每天仅探一次
+    lastHealthCheckDate = today;
+    await Promise.all(BK_PROBE_TARGETS.map(probeOne));
+    // 可视化：将被软熔断（连败达阈值）的备用源以 console.warn 提示（每天一次）
+    var fused = BK_PROBE_TARGETS.filter(function (t) { return bkScoreOf(t.key) === 1; }).map(function (t) { return t.key; });
+    if (fused.length && typeof console !== 'undefined' && console.warn) {
+      console.warn('[qq.js 健康巡检] 以下备用源当日探测不可达、已被软熔断降权：' + fused.join('、') + '；恢复后自动复位。');
+    }
+  }
+
   // ---------- 取链（官方优先 + ②/③/④ 并发竞速 + 9s 软上限） ----------
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
   // 与官方 maotoumao/MusicFreePlugins qq.js 的 getSourceUrl 逐字节对齐的“质量→文件前缀”映射
@@ -1341,6 +1410,8 @@
     return domain + purl;
   }
   async function getMediaSource(musicItem, quality) {
+    // 【v0.1.9 健康度巡检】每日首次取链前对 6 个备用域做 HEAD 探活（非阻塞，仅影响软熔断排序，不阻塞首播）
+    if (typeof setTimeout === 'function') { probeBackupHealth().catch(function () {}); }
     // 【v0.1.6 第二批】缓存命中即 0ms 返回（重复播放 / 预取命中），不再走任何网络。
     var cachedUrl = urlCacheGet(musicItem, quality);
     if (cachedUrl) return { url: cachedUrl };
@@ -1414,14 +1485,18 @@
       if (off && off.url) return finish({ url: off.url });
 
       // ⑤⑥⑦ 与 ②③④ 全部在 t=0 并发启动（总耗时 = 单层 worst-case，非各层之和）。
-      // 【v0.1.6 第四~六批】改为【分层竞速】：高优先组（音乐搜索神器 → GD音乐台 → MyFreeMP3）在
-      // BK_TIER_MS 窗口内独占出线权（组内按数组次序软优先）；窗口结束或被全部否决后，全 6 源首出即用。
-      // 这样既落实船长指定的验收顺序，又不会被任一慢源拖满超时。
-      // 【v0.1.6 第七批】组内次序改为「健康度自适应」：bkOrderGroup 在**全部健康**时返回原序（逐位等于
-      // 验收顺序），仅把连续失败 ≥ 阈值的源沉到该组末位，使其不再白占出线窗口；成功后立即复位。
+      // 【v0.1.6 第四~六批】改为【分层竞速】：高优先组在 BK_TIER_MS 窗口内独占出线权；窗口结束或被全部否决后，全源首出即用。
+      // 【v0.1.9 解耦】第 ⑤ 层 music.lmb520.cn 与 sq.js 唯一后端同源 → 移出高优先独占窗口、降为「最后兜底」组（组 2）。
+      //   ===== BACKUP_SOURCES（备用源依赖关系）=====
+      //   组 0（BK_TIER_MS 窗口内独占出线权，均独立于 sq）：⑥ GD音乐台 music-api.gdstudio.xyz ／ ⑦ MyFreeMP3 www.puduoduo.top
+      //   组 1（窗口后首出即用，均独立于 sq）：② AAX音乐网 aax.cx ／ ③ 无名音乐网 mvmp3.com ／ ④ 无忧音乐网 qeecc.com
+      //   组 2（仅前两组全败/全慢时兜底，★非独立冗余★）：⑤ 音乐搜索神器 music.lmb520.cn（与 sq.js 同源，不计入独立备用源）
+      //   独立备用源计数 = 组0 + 组1 = 5 个（gd/myf/aax/mv/qe）。sq 失效时 qq.js 仍由这 5 个真正独立的源承担取链，双依赖彻底解耦。
+      //   注：若需恢复「6 个真正独立备用源」，按 Plan B 将 ⑤ 替换为独立聚合网关（可选，开发成本较高）；当前以保持低成本解耦为准。
       var bk = await raceTiered([
-        bkOrderGroup([{ key: 'sq', p: sqP }, { key: 'gd', p: gdP }, { key: 'myf', p: myfP }]),
+        bkOrderGroup([{ key: 'gd', p: gdP }, { key: 'myf', p: myfP }]),
         bkOrderGroup([{ key: 'aax', p: aaxP }, { key: 'mvmp3', p: mvP }, { key: 'qeecc', p: qeP }]),
+        bkOrderGroup([{ key: 'sq', p: sqP }]),
       ], BK_TIER_MS);
       if (bk) return finish({ url: bk });
       // 全部备用源皆败，但存在「已通过身份校验」的次优链（仅时长未知场景）→ 超时/失败前仍返回，最大化“有歌可播”
@@ -1788,17 +1863,18 @@
 
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.1.8',
+    version: '0.1.9',
     author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '【v0.1.8 校验口径调整】备用源校验由「歌名+作者+时长」收为「歌名+作者」双因子，取消时长校验（时长多源返回不可靠/缺失），取链热路径不再比对时长、进一步提速；歌手校验仍严格（程响等异歌手翻唱一律拦截，去年夏天-王大毛 仍由作者校验命中原版）。' +
       '【v0.1.6 取链提速】官方抢跑窗口 7s→3s、各源超时统一收紧至 3s；' +
       '【v0.1.6 播放链缓存+预取】同一首歌二次播放 0ms 命中（TTL 5 分钟、LRU 100 条、按音质分槽），搜索/歌单详情返回后自动预热前 3 首；' +
-      '【v0.1.6 新增三个备用源】音乐搜索神器(music.lmb520.cn)、GD音乐台(music-api.gdstudio.xyz)、MyFreeMP3(mp3.zaodoc.com → www.puduoduo.top) 均为免登录聚合 API，与②③④一并【首出即用】竞速（高优先组 ⑤⑥⑦ 独占 1.2s 窗口，之后全 6 源首出即用）；' +
+      '【v0.1.6 新增三个备用源】音乐搜索神器(music.lmb520.cn)、GD音乐台(music-api.gdstudio.xyz)、MyFreeMP3(mp3.zaodoc.com → www.puduoduo.top) 均为免登录聚合 API，与 ②③④ 一并并发竞速；' +
+      '【v0.1.9 解耦】第 ⑤ 层 music.lmb520.cn 与 sq.js 同源（非独立冗余），移出高优先窗口、降为最后兜底；高优先组仅 GD音乐台/MyFreeMP3 独占 1.2s 窗口，之后 aax/mvmp3/qeecc 首出即用，真正独立备用源 = gd/myf/aax/mv/qe 共 5 个；' +
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
       '播放取链【v0.1.6 共 7 层兜底】：①官方QQ(CgiGetVkey，需登录Cookie解锁) 优先(≤3s)，' +
       '②音乐搜索神器 ③GD音乐台 ④MyFreeMP3 ⑤AAX音乐网 aax.cx ⑥无名音乐网 mvmp3 ⑦无忧音乐网 qeecc.com 全部并发启动；' +
-      '采纳顺序（用户指定验收顺序）：官方 → 音乐搜索神器 → GD音乐台 → MyFreeMP3 → aax → mvmp3 → qeecc；' +
+      '采纳顺序（竞速分层，【v0.1.9 解耦】）：官方 → GD音乐台 → MyFreeMP3（高优先组独占 1.2s 窗口）→ aax → mvmp3 → qeecc（窗口后首出即用）→ 音乐搜索神器 music.lmb520.cn（最后兜底，与 sq.js 同源、非独立冗余）；真正独立的备用源为 gd/myf/aax/mv/qe 共 5 个，sq 失效不影响取链；' +
       'aax 条目自带时长、做歌名+作者+时长三重校验最严，mvmp3 按「歌手 - 歌名」做歌名+作者+时长校验，其余源同样走歌名/作者/时长多重身份校验；' +
       '②③④（HTML 站点）的检索走【全名/剥离注解】并发双查并集，⑤⑥⑦（聚合 API）走先全名、剥离名兜底的串行双查；' +
       '②③④ 的人机验证均由插件自动完成（与 mvmp3 同构的 CSRF 会话方案）并缓存 50 分钟，无需手动操作；' +
@@ -1808,7 +1884,7 @@
       '现改为 ①QQ官方歌词（须过时长/占位校验，无版权曲 retcode=-1901 空歌词不再当成功）→ ②取链时顺带缓存的该源歌词（零额外请求、与播放音源同源同轴）→ ③按【歌名+歌手】在 mvmp3/aax 并发反查；' +
       '并过滤站点占位歌词（如“暂无歌词内容”）与水印行；同时修正非 QQ songmid 盲试官方取链白等约 5s 的问题；' +
       '三个备用源（mvmp3 / aax / qeecc）的会话均已在插件加载与搜索时后台预热并 40 分钟续期，歌词冷路径由 2—7s 降至 2.2—3.6s。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.8/musicfree-qq/qq.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.9/musicfree-qq/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
@@ -1900,6 +1976,10 @@
       bkOrderGroup: bkOrderGroup,
       bkHealthSnapshot: bkHealthSnapshot,
       bkHealthReset: bkHealthReset,
+      // 【v0.1.9 健康度巡检】每日 HEAD 探活快照与触发（软熔断状态可视化入口）
+      bkProbeSnapshot: bkProbeSnapshot,
+      lastHealthCheckDate: function () { return lastHealthCheckDate; },
+      probeBackupHealth: probeBackupHealth,
       BK_FAIL_THRESHOLD: BK_FAIL_THRESHOLD,
       safeUrl: safeUrl,
       stripJsonp: stripJsonp,
