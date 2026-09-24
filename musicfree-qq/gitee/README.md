@@ -12,7 +12,7 @@ https://gitee.com/koujiao/musicfree-tianpeng/raw/master/musicfree-qq/gitee/qq.js
 下载 `qq.js` 文件，在 MusicFree 中手动导入。
 
 ## 更新日志
-### 0.1.6 (2026-09-23)
+### 0.1.7 (2026-09-23)
 - 发布版，包含完整插件逻辑（单文件、无外部依赖）
 - 支持搜索、播放、歌单等功能
 
