@@ -1,6 +1,6 @@
 # 网易云音乐音源插件（wy.js）使用说明
 
-> **平台**：网易云音乐 ｜ **版本**：v0.1.0 ｜ **作者**：tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)
+> **平台**：网易云音乐 ｜ **版本**：v0.1.1 ｜ **作者**：tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)
 > **适配**：[MusicFree](https://github.com/maotoumao/MusicFree) 桌面端 / 移动端
 
 ---
