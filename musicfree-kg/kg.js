@@ -546,14 +546,8 @@
         const kg = await kugouGetMediaSource(musicItem);
         if (kg && kg.url && /^https?:\/\//i.test(kg.url)) {
           KG_OFFICIAL_FUSE_STREAK = 0;   // 取得有效直链 → 复位连续空计数
-          try {
-            const head = await axios.head(kg.url, { timeout: 4000, validateStatus: function () { return true; } });
-            const ct = (head.headers && head.headers['content-type']) || '';
-            const ok = head.status >= 200 && head.status < 400 && /audio|mp4|octet|mpeg/i.test(ct || 'audio');
-            if (ok) return { url: kg.url, rawLrc: kg.rawLrc, artwork: kg.artwork, headers: { Referer: 'https://www.kugou.com/' } };
-          } catch (e) {
-            return { url: kg.url, rawLrc: kg.rawLrc, artwork: kg.artwork, headers: { Referer: 'https://www.kugou.com/' } };
-          }
+          // 【v0.1.2】删除酷狗直链 HEAD 探测（v0.1.0 引入）：该探测成功/失败都返回同一 kg.url，对结果零收益；且每首首播同步阻塞≤4000ms（酷狗 CDN 对 HEAD 常慢/无响应）。直接返回直链，回归 v0.0.9 速度。
+          return { url: kg.url, rawLrc: kg.rawLrc, artwork: kg.artwork, headers: { Referer: 'https://www.kugou.com/' } };
         } else {
           KG_OFFICIAL_FUSE_STREAK++;
           if (KG_OFFICIAL_FUSE_STREAK >= KG_OFFICIAL_FUSE_LIMIT && !KG_OFFICIAL_FUSED) {
@@ -920,16 +914,17 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '酷狗',
-    version: '0.1.0',
+    version: '0.1.2',
     author: 'tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)',
     description: '酷狗官方 + 无名音乐网(mvmp3，自动过人机验证) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 四层兜底取链；' +
       'v0.1.0：下沉 qq.js v0.1.8 三态身份校验修复「同名异版错播」、新增第③备用源 AAX音乐网(三层→四层)、' +
       '酷狗官方取链软熔断(连续空返回5次跳过)、取链质量打分(matchScore择优)；' +
+      'v0.1.2：删除酷狗直链 HEAD 探测（v0.1.0 引入的≤4000ms 首播阻塞、零收益），取得直链直接返回，回归 v0.0.9 速度；' +
       '支持酷狗歌单导入、官方排行榜（按热歌/地区/特色/全球/曲风分层）与热门榜单；' +
       '热门歌单广场（分类标签浏览酷狗歌单）。' +
       'v0.0.9 修复：歌单详情/导入取歌改用 mobilecdn special/song JSON 接口，解决点进歌单歌曲空白。' +
       '⚠️ 仅供个人学习与研究使用。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.0/musicfree-kg/kg.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.2/musicfree-kg/kg.js',
     cacheControl: 'no-store',
     supportedSearchType: ['music'],
     primaryKey: ['id', 'album_id', 'album_audio_id'],
