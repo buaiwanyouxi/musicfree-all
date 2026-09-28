@@ -672,6 +672,9 @@
   // ============================ 歌单曲目缓存 + 大歌单节流 ============================
   // v0.1.1 第二批：歌单详情按 sheet.id 缓存（避免每翻一页都重新拉全量 trackIds + 分批 /song/detail），
   //   大歌单（trackIds > 阈值）分批取 /song/detail 时加请求间隔，避免服务端 460/限流。
+  // v0.1.3：/playlist/detail 显式传 limit(大值)，修复「推荐歌单/精品歌单只能取前 10 首」：
+  //   网易云未加密接口对推荐/精品歌单在未传 limit 时默认仅回前 ~10 首 tracks 且 trackIds 可能缺失，
+  //   旧逻辑走 tracks.map 直接分支被静默截断为前 10 首；传大 limit 后 tracks 直接回全量。
   var _sheetCache = {};                 // id -> { at, songs }
   var SHEET_CACHE_TTL = 5 * 60 * 1000; // 5 分钟（翻页期间命中，超时后自动回源）
   var SHEET_THROTTLE_MS = 200;         // 大歌单分批间隔（毫秒）
@@ -682,7 +685,8 @@
     var key = String(id);
     var cached = _sheetCache[key];
     if (cached && (Date.now() - cached.at) < SHEET_CACHE_TTL) return cached.songs; // 命中缓存，零重复请求
-    var detail = toObj(await nget('/playlist/detail', { id: key }));
+    // v0.1.3：显式传 limit 拉全量 tracks（推荐/精品歌单未传 limit 时接口默认仅回前 ~10 首）
+    var detail = toObj(await nget('/playlist/detail', { id: key, limit: 1000, offset: 0 }));
     var result = detail.result || detail;
     var trackIds = (result.trackIds || []).map(function (t) { return t.id; });
     var tracks = result.tracks || [];
@@ -780,15 +784,17 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '网易云音乐',
-    version: '0.1.1',
+    version: '0.1.3',
     author: 'tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)',
     description: '网易云音乐音源：支持歌单导入（含大歌单全量+分页缓存）、热门歌单、官方排行榜，附带搜索/歌词/取链。' +
       '全部走免加密官方 /api 接口；VIP/付费曲目免费态仅返回约 30 秒试听片段（版权限制）。' +
       'v0.1.1：下沉 qq.js v0.1.8 三态身份校验修复「同名异版错播」（无安全候选一律拒绝错播，不再回退未过滤列表）；' +
       '取链四层兜底【官方 → 无名音乐网 mvmp3（①首选）→ 歌曲宝 gequbao（②次选）→ 布谷音乐 buguyy.top（③兜底）】，最大化可播率。' +
       'v0.1.1 第四批：新增官方接口监控埋点（连续 5 次失败告警；weapi 加密兜底暂缓）。' +
-      'v0.1.1 第五批：官方 /api 偶发 460/429/5xx 失败指数退避重试（1s→2s→4s），其余错误立即抛出不重试。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.1/musicfree-wy/wy.js',
+      'v0.1.1 第五批：官方 /api 偶发 460/429/5xx 失败指数退避重试（1s→2s→4s），其余错误立即抛出不重试。' +
+      'v0.1.3：修复「推荐歌单/精品歌单只能获取前 10 首」——/playlist/detail 显式传 limit(1000)，使 tracks 直接回全量曲目，' +
+      '不再因接口默认仅回前 ~10 首且 trackIds 缺失而被静默截断；大歌单(>1000)仍走 trackIds 分批 /song/detail 兜底。',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.3/musicfree-wy/wy.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music', 'sheet'],
     userVariables: [
