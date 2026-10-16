@@ -1,5 +1,5 @@
 // QQ音乐（腾讯系）音源插件
-// 平台：QQ音乐  author：tianpeng  version：0.1.9
+// 平台：QQ音乐  author：tianpeng  version：0.1.10
 //
 // 接口契约（经运行时真实联网探测 + 研读 jsososo/QQMusicApi 开源实现得出，全部免签端点）：
 //   搜索        GET  c.y.qq.com/soso/fcgi-bin/client_search_cp?aggr=1&cr=1&flag_qc=0&p=<page>&n=30&w=<kw>&format=json
@@ -1308,6 +1308,11 @@
     { key: 'mvmp3', url: 'https://www.mvmp3.com/' },
     { key: 'qeecc', url: 'https://www.qeecc.com/' },
     { key: 'sq',    url: 'https://music.lmb520.cn/' },
+    { key: 'gequhai', url: 'https://www.gequhai.com/' },
+    { key: 'gequke', url: 'https://www.gequke.com/' },
+    { key: 'fengli', url: 'https://www.flmp3.pro/' },
+    { key: 'liusheng', url: 'http://www.6sing.top/' },
+    { key: 'xiage', url: 'https://tonzhon.com/' },
   ];
   function todayStr() {
     var d = new Date();
@@ -1350,6 +1355,199 @@
       console.warn('[qq.js 健康巡检] 以下备用源当日探测不可达、已被软熔断降权：' + fused.join('、') + '；恢复后自动复位。');
     }
   }
+
+  // ===================== 备用音源②+：新增酷我系 4 源 + 聚合系 1 源（第四批 qq 扩池） =====================
+  // 【v0.1.x 第四批】将 gequhai/gequke/fengli/liusheng（酷我系） + xiage（聚合/网易）并入竞速池，提升酷我系命中率与冗余。
+  // 约束：qq.js 刻意不依赖 cheerio（移动端沙箱不注入，见 v0.1.0 注释），故本段全部采用【纯正则】解析（对齐既有 aax/mvmp3/qeecc）。
+  //   注：此 4 酷我系源取链机制与 aax/qeecc 的 /js/play.php CMS 不同（play_id+api/music、playurl.php、play.php），故独立适配。
+
+  // ---- 通用适配：dualTitleSearch + pickOrdered 身份校验 + safeUrl + validatePlayable（对齐 siteGetMediaSource 安全链）----
+  async function kuwoNewGetMediaSource(cfg, musicItem, signal, onMatch) {
+    if (!musicItem.title && !musicItem.artist) throw new Error('歌曲标题为空，无法在' + cfg.name + '检索');
+    // 契约：dualTitleSearch 期望 searchFn 直接返回「条目数组」（它会自行包成 {items,kw}）；
+    //   此处若回 {items,kw} 会让其内部 merge() 把对象当数组 forEach → 崩溃。故仅透传数组。
+    function doSearch(kw, sig) {
+      return cfg.search(kw, sig).then(function (items) { return items || []; });
+    }
+    var q = await dualTitleSearch(doSearch, musicItem, signal);
+    var items = q.items, kw = q.kw;
+    if (!items.length) { if (q.error) throw q.error; throw new Error(cfg.name + '未找到：' + kw); }
+    var ordered = pickOrdered(items, musicItem);
+    if (!ordered || !ordered.length) throw new Error(cfg.name + '：候选与目标身份不符（歌名/歌手/时长冲突或均无法验证），已拒绝错播');
+    var lastErr = '';
+    for (var i = 0; i < Math.min(ordered.length, 3); i++) {
+      try {
+        var u = await cfg.playUrl(ordered[i], signal);
+        if (u) {
+          var su = safeUrl(u);
+          if (su && onMatch) onMatch(su);
+          if (su && await validatePlayable(su, signal)) return { url: su };
+          lastErr = '空链接/不可播';
+        }
+      } catch (e) { lastErr = e.message; }
+    }
+    throw new Error(cfg.name + '可取链候选均不可播（' + (lastErr || '无可用链接') + '）');
+  }
+
+  // ---- 酷我系：歌曲海 gequhai.com（play_id + 会话 cookie 取 kuwo 直链）----
+  var GH_BASE = 'https://www.gequhai.com', GH_UA = SITE_UA;
+  async function ghSearch(kw, signal) {
+    var r = await axios.get(GH_BASE + '/search?s=' + encodeURIComponent(kw), {
+      headers: { 'User-Agent': GH_UA }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var html = r.data || '';
+    var items = [], seen = {};
+    var re = /<a class="text-info font-weight-bold" href="\/play\/(\d+)"[^>]*>([^<]*)<\/a><\/td><td[^>]*>([^<]*)<\/td>/g;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+      var title = (m[2] || '').trim();
+      var artist = (m[3] || '').trim() || '未知歌手';
+      if (title) items.push({ id: id, title: title, artist: artist });
+    }
+    return items;
+  }
+  async function ghPlayUrl(item, signal) {
+    var dres = await axios.get(GH_BASE + '/play/' + item.id, { headers: { 'User-Agent': GH_UA }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; } });
+    var text = dres.data || '';
+    var pm = text.match(/window\.play_id\s*=\s*'([^']+)'/);
+    if (!pm) throw new Error('歌曲海：无play_id');
+    var playId = pm[1];
+    var resp = await axios.post(GH_BASE + '/api/music', 'id=' + encodeURIComponent(playId) + '&type=0', {
+      headers: { 'User-Agent': GH_UA, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'Http', 'X-Custom-Header': 'Key', 'Referer': GH_BASE + '/play/' + item.id, 'Origin': GH_BASE, 'Accept': 'application/json, text/javascript, */*; q=0.01' },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var j; try { j = toObj(resp.data); } catch (e) { throw new Error('歌曲海：解析失败'); }
+    if (!j || j.code !== 200 || !j.data || !j.data.url) throw new Error('歌曲海：取链失败' + (j ? '(' + j.code + ')' : ''));
+    return j.data.url;
+  }
+
+  // ---- 酷我系：歌曲客 gequke.com（同歌曲海基线，/song/ 路径）----
+  var GK_BASE = 'https://www.gequke.com', GK_UA = GH_UA;
+  async function gkSearch(kw, signal) {
+    var r = await axios.get(GK_BASE + '/search?s=' + encodeURIComponent(kw), {
+      headers: { 'User-Agent': GK_UA }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var html = r.data || '';
+    var items = [], seen = {};
+    var re = /<a class="text-info font-weight-bold" href="\/song\/(\d+)"[^>]*>([^<]*)<\/a><\/td><td[^>]*>([^<]*)<\/td>/g;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+      var title = (m[2] || '').trim();
+      var artist = (m[3] || '').trim() || '未知歌手';
+      if (title) items.push({ id: id, title: title, artist: artist });
+    }
+    return items;
+  }
+  async function gkPlayUrl(item, signal) {
+    var dres = await axios.get(GK_BASE + '/song/' + item.id, { headers: { 'User-Agent': GK_UA }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; } });
+    var text = dres.data || '';
+    var pm = text.match(/window\.play_id\s*=\s*'([^']+)'/);
+    if (!pm) throw new Error('歌曲客：无play_id');
+    var playId = pm[1];
+    var resp = await axios.post(GK_BASE + '/api/music', 'id=' + encodeURIComponent(playId) + '&type=0', {
+      headers: { 'User-Agent': GK_UA, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'Http', 'X-Custom-Header': 'Key', 'Referer': GK_BASE + '/song/' + item.id, 'Origin': GK_BASE, 'Accept': 'application/json, text/javascript, */*; q=0.01' },
+      timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var j; try { j = toObj(resp.data); } catch (e) { throw new Error('歌曲客：解析失败'); }
+    if (!j || j.code !== 200 || !j.data || !j.data.url) throw new Error('歌曲客：取链失败' + (j ? '(' + j.code + ')' : ''));
+    return j.data.url;
+  }
+
+  // ---- 酷我系：凤梨音乐 flmp3.pro（kuwo CDN 直链）----
+  var FL_BASE = 'https://www.flmp3.pro', FL_UA = SITE_UA;
+  async function flSearch(kw, signal) {
+    var r = await axios.get(FL_BASE + '/search.html?keyword=' + encodeURIComponent(kw) + '&page=1', {
+      headers: { 'User-Agent': FL_UA, 'Referer': FL_BASE + '/', 'X-Requested-With': 'XMLHttpRequest' }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var html = r.data || '';
+    var items = [], seen = {};
+    var re = /<a href="\/song\/(\d+)\.html">[\s\S]*?<h3>([^<]*)<\/h3>[\s\S]*?<p>([^<]*)<\/p>/g;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+      var title = (m[2] || '').trim();
+      var artist = (m[3] || '').trim() || '未知歌手';
+      if (title) items.push({ id: id, title: title, artist: artist });
+    }
+    return items;
+  }
+  async function flPlayUrl(item, signal) {
+    var r = await axios.get(FL_BASE + '/api/playurl.php?id=' + item.id, {
+      headers: { 'User-Agent': FL_UA, 'Referer': FL_BASE + '/' }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var url = String(r.data || '').trim();
+    if (!/^https?:\/\//.test(url)) throw new Error('凤梨：未解析到直链');
+    return url;
+  }
+
+  // ---- 酷我系：溜声音乐 6sing.top（http 站点，kuwo CDN 直链）----
+  var LS_BASE = 'http://www.6sing.top', LS_UA = SITE_UA;
+  function lsParseTitle(raw) {
+    raw = (raw || '').trim(); if (!raw) return { title: '未知歌曲', artist: '未知歌手' };
+    var title = raw, artist = '未知歌手'; var NO = /版|伴奏|演奏|Remix|remix|DJ|flac|mp3/i;
+    var pm = raw.match(/[（(]([^）)]*)[）)]/); if (pm && pm[1].length > 0 && pm[1].length <= 5 && !NO.test(pm[1])) artist = pm[1].trim();
+    var di = raw.lastIndexOf('-'); if (di >= 0) { var tail = raw.slice(di + 1).trim().replace(/[）)]/g, '').trim(); if (tail && tail.length >= 1 && tail.length <= 10 && !NO.test(tail)) { artist = tail; title = raw.slice(0, di).trim(); } }
+    title = title.replace(/[（(][^）)]*[）)]/g, '').trim(); if (!title) title = raw; return { title: title, artist: artist };
+  }
+  async function lsSearch(kw, signal) {
+    var r = await axios.get(LS_BASE + '/search.html?keyword=' + encodeURIComponent(kw), {
+      headers: { 'User-Agent': LS_UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9' }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var html = r.data || '';
+    var items = [], seen = {};
+    var re = /<a href="\/detail\/(\d+)\.html"[^>]*title="([^"]*)"/g;
+    var m;
+    while ((m = re.exec(html))) {
+      var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+      var p = lsParseTitle(m[2]);
+      if (p.title) items.push({ id: id, title: p.title, artist: p.artist });
+    }
+    return items;
+  }
+  async function lsPlayUrl(item, signal) {
+    var resp = await axios.get(LS_BASE + '/api/play.php?id=' + encodeURIComponent(item.id), {
+      headers: { 'User-Agent': LS_UA, 'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest', 'Referer': LS_BASE + '/detail/' + item.id + '.html' }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    });
+    var j; try { j = toObj(resp.data); } catch (e) { throw new Error('溜声：解析失败'); }
+    if (!j || j.code !== '200' || !j.url) throw new Error('溜声：取链失败' + (j ? '(' + j.code + ')' : ''));
+    return j.url;
+  }
+
+  // ---- 聚合/网易：我要下歌 xiage（Tonzhon 源，网易云直链 via url 接口）----
+  var XG_TZ = 'https://tonzhon.com/api.php', XG_UA = SITE_UA;
+  function xgPost(types, extra, signal) {
+    var data = Object.assign({ types: types }, extra || {}); var parts = [];
+    Object.keys(data).forEach(function (k) { parts.push(k + '=' + encodeURIComponent(data[k])); });
+    return axios.post(XG_TZ, parts.join('&'), {
+      headers: { 'User-Agent': XG_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://tonzhon.com/' }, timeout: SRC_TIMEOUT, signal: signal, validateStatus: function () { return true; },
+    }).then(function (r) { return r.data; });
+  }
+  function xgFlattenArtist(a) {
+    if (!a) return ''; if (typeof a === 'string') return a;
+    if (Object.prototype.toString.call(a) === '[object Array]') { var out = []; for (var i = 0; i < a.length; i++) { var x = a[i]; if (typeof x === 'string') out.push(x); else if (Object.prototype.toString.call(x) === '[object Array]') out.push(x.join('/')); else if (x && x.name) out.push(x.name); } return out.filter(Boolean).join('/'); }
+    return '';
+  }
+  async function xgSearch(kw, signal) {
+    try {
+      var arr = await xgPost('search', { source: 'netease', name: kw, pages: 1, count: 8 }, signal);
+      if (!Array.isArray(arr)) return [];
+      return arr.map(function (it) { return { id: 'tz_' + String(it.id), title: it.name || '', artist: xgFlattenArtist(it.artist), _nzId: String(it.id) }; });
+    } catch (e) { return []; }
+  }
+  async function xgPlayUrl(item, signal) {
+    var nid = item && item._nzId; if (!nid) throw new Error('我要下歌：缺少网易云 ID');
+    try { var r = await xgPost('url', { id: nid, source: 'netease' }, signal); var u = r && r.url ? String(r.url).replace(/^http:\/\//i, 'https://') : ''; if (u) return u; } catch (e) {}
+    throw new Error('我要下歌：网易云直链获取失败');
+  }
+
+  // ---- 配置（供 kuwoNewGetMediaSource 调用；playUrl 透传 item）----
+  var GH_CFG = { name: '歌曲海', search: ghSearch, playUrl: ghPlayUrl };
+  var GK_CFG = { name: '歌曲客', search: gkSearch, playUrl: gkPlayUrl };
+  var FL_CFG = { name: '凤梨音乐', search: flSearch, playUrl: flPlayUrl };
+  var LS_CFG = { name: '溜声音乐', search: lsSearch, playUrl: lsPlayUrl };
+  var XG_CFG = { name: '我要下歌', search: xgSearch, playUrl: xgPlayUrl };
 
   // ---------- 取链（官方优先 + ②/③/④ 并发竞速 + 9s 软上限） ----------
   // 官方 QQ 取链（需登录态 authst cookie；免费曲返回完整链；VIP/试听曲官方不给链）
@@ -1479,6 +1677,22 @@
       var qeP = srcTrack('qeecc', siteGetMediaSource(QEECC, musicItem, signal, onMatch))
         .then(function (r) { return { url: r.url }; })
         .catch(function (e) { errs.push('qeecc:' + (e && e.message)); return null; });
+      // ②+ 第四批 qq 扩池：新增酷我系 4 源（歌曲海/歌曲客/凤梨/溜声）+ 聚合 1 源（我要下歌），并入竞速池增冗余
+      var ghP = srcTrack('gequhai', kuwoNewGetMediaSource(GH_CFG, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('gequhai:' + (e && e.message)); return null; });
+      var gkP = srcTrack('gequke', kuwoNewGetMediaSource(GK_CFG, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('gequke:' + (e && e.message)); return null; });
+      var flP = srcTrack('fengli', kuwoNewGetMediaSource(FL_CFG, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('fengli:' + (e && e.message)); return null; });
+      var lsP = srcTrack('liusheng', kuwoNewGetMediaSource(LS_CFG, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('liusheng:' + (e && e.message)); return null; });
+      var xgP = srcTrack('xiage', kuwoNewGetMediaSource(XG_CFG, musicItem, signal, onMatch))
+        .then(function (r) { return { url: r.url }; })
+        .catch(function (e) { errs.push('xiage:' + (e && e.message)); return null; });
 
       // ① 官方抢跑窗口（【v0.1.6 第一批】7000→3000）：窗口内官方出链则用官方；超时立即让位备用源，不再干等。
       var off = await Promise.race([offP, new Promise(function (res) { setTimeout(res, OFFICIAL_GRACE_MS); })]);
@@ -1490,18 +1704,19 @@
       //   ===== BACKUP_SOURCES（备用源依赖关系）=====
       //   组 0（BK_TIER_MS 窗口内独占出线权，均独立于 sq）：⑥ GD音乐台 music-api.gdstudio.xyz ／ ⑦ MyFreeMP3 www.puduoduo.top
       //   组 1（窗口后首出即用，均独立于 sq）：② AAX音乐网 aax.cx ／ ③ 无名音乐网 mvmp3.com ／ ④ 无忧音乐网 qeecc.com
+      //        ＋【第四批新增】歌曲海 gequhai.com ／ 歌曲客 gequke.com ／ 凤梨音乐 flmp3.pro ／ 溜声音乐 6sing.top ／ 我要下歌（Tonzhon 网易）
       //   组 2（仅前两组全败/全慢时兜底，★非独立冗余★）：⑤ 音乐搜索神器 music.lmb520.cn（与 sq.js 同源，不计入独立备用源）
-      //   独立备用源计数 = 组0 + 组1 = 5 个（gd/myf/aax/mv/qe）。sq 失效时 qq.js 仍由这 5 个真正独立的源承担取链，双依赖彻底解耦。
+      //   独立备用源计数 = 组0 + 组1 = 10 个（gd/myf/aax/mv/qe/gequhai/gequke/fengli/liusheng/xiage）。sq 失效时 qq.js 仍由这 10 个真正独立的源承担取链，双依赖彻底解耦。
       //   注：若需恢复「6 个真正独立备用源」，按 Plan B 将 ⑤ 替换为独立聚合网关（可选，开发成本较高）；当前以保持低成本解耦为准。
       var bk = await raceTiered([
         bkOrderGroup([{ key: 'gd', p: gdP }, { key: 'myf', p: myfP }]),
-        bkOrderGroup([{ key: 'aax', p: aaxP }, { key: 'mvmp3', p: mvP }, { key: 'qeecc', p: qeP }]),
+        bkOrderGroup([{ key: 'aax', p: aaxP }, { key: 'mvmp3', p: mvP }, { key: 'qeecc', p: qeP }, { key: 'gequhai', p: ghP }, { key: 'gequke', p: gkP }, { key: 'fengli', p: flP }, { key: 'liusheng', p: lsP }, { key: 'xiage', p: xgP }]),
         bkOrderGroup([{ key: 'sq', p: sqP }]),
       ], BK_TIER_MS);
       if (bk) return finish({ url: bk });
       // 全部备用源皆败，但存在「已通过身份校验」的次优链（仅时长未知场景）→ 超时/失败前仍返回，最大化“有歌可播”
       if (bestSoFar) return finish({ url: bestSoFar });
-      throw new Error('《' + name + '》官方取链失败，且备用音源（音乐搜索神器 / GD音乐台 / MyFreeMP3 / aax / mvmp3 / qeecc）均未取得：' + (errs.join('；') || '未知原因') +
+      throw new Error('《' + name + '》官方取链失败，且备用音源（音乐搜索神器 / GD音乐台 / MyFreeMP3 / aax / mvmp3 / qeecc / 歌曲海 / 歌曲客 / 凤梨 / 溜声 / 我要下歌）均未取得：' + (errs.join('；') || '未知原因') +
         '。备用源提示“验证失败”多为站点临时升级，稍后重试即可；极冷门曲多源均可能无匹配。');
     } finally {
       if (deadline) clearTimeout(deadline);
@@ -1863,7 +2078,7 @@
 
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.1.9',
+    version: '0.1.10',
     author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入。' +
       '【v0.1.8 校验口径调整】备用源校验由「歌名+作者+时长」收为「歌名+作者」双因子，取消时长校验（时长多源返回不可靠/缺失），取链热路径不再比对时长、进一步提速；歌手校验仍严格（程响等异歌手翻唱一律拦截，去年夏天-王大毛 仍由作者校验命中原版）。' +
@@ -1874,7 +2089,7 @@
       '浏览类功能（搜索、歌词、排行榜、热门歌单、歌单导入）均走免签旧版 cgi-bin 端点；' +
       '播放取链【v0.1.6 共 7 层兜底】：①官方QQ(CgiGetVkey，需登录Cookie解锁) 优先(≤3s)，' +
       '②音乐搜索神器 ③GD音乐台 ④MyFreeMP3 ⑤AAX音乐网 aax.cx ⑥无名音乐网 mvmp3 ⑦无忧音乐网 qeecc.com 全部并发启动；' +
-      '采纳顺序（竞速分层，【v0.1.9 解耦】）：官方 → GD音乐台 → MyFreeMP3（高优先组独占 1.2s 窗口）→ aax → mvmp3 → qeecc（窗口后首出即用）→ 音乐搜索神器 music.lmb520.cn（最后兜底，与 sq.js 同源、非独立冗余）；真正独立的备用源为 gd/myf/aax/mv/qe 共 5 个，sq 失效不影响取链；' +
+      '采纳顺序（竞速分层，【v0.1.9 解耦】【v0.1.x 第四批扩池】）：官方 → GD音乐台 → MyFreeMP3（高优先组独占 1.2s 窗口）→ aax → mvmp3 → qeecc → 歌曲海 → 歌曲客 → 凤梨 → 溜声 → 我要下歌（窗口后首出即用）→ 音乐搜索神器 music.lmb520.cn（最后兜底，与 sq.js 同源、非独立冗余）；真正独立的备用源为 gd/myf/aax/mv/qe/gequhai/gequke/fengli/liusheng/xiage 共 10 个，sq 失效不影响取链；' +
       'aax 条目自带时长、做歌名+作者+时长三重校验最严，mvmp3 按「歌手 - 歌名」做歌名+作者+时长校验，其余源同样走歌名/作者/时长多重身份校验；' +
       '②③④（HTML 站点）的检索走【全名/剥离注解】并发双查并集，⑤⑥⑦（聚合 API）走先全名、剥离名兜底的串行双查；' +
       '②③④ 的人机验证均由插件自动完成（与 mvmp3 同构的 CSRF 会话方案）并缓存 50 分钟，无需手动操作；' +
@@ -1884,7 +2099,7 @@
       '现改为 ①QQ官方歌词（须过时长/占位校验，无版权曲 retcode=-1901 空歌词不再当成功）→ ②取链时顺带缓存的该源歌词（零额外请求、与播放音源同源同轴）→ ③按【歌名+歌手】在 mvmp3/aax 并发反查；' +
       '并过滤站点占位歌词（如“暂无歌词内容”）与水印行；同时修正非 QQ songmid 盲试官方取链白等约 5s 的问题；' +
       '三个备用源（mvmp3 / aax / qeecc）的会话均已在插件加载与搜索时后台预热并 40 分钟续期，歌词冷路径由 2—7s 降至 2.2—3.6s。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.9/musicfree-qq/qq.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.10/musicfree-qq/github/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
