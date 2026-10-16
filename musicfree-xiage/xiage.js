@@ -1,109 +1,109 @@
-// 我要下歌 (xiage) MusicFree 插件 · 后端：铜钟 Tonzhon (https://tonzhon.com)
-// 全链路统一走 Tonzhon 音源 (https://tonzhon.com/api.php)：
-//   - 歌单/排行榜  : Tonzhon types=playlist（网易云/酷狗/QQ 三源）
-//   - 搜索          : Tonzhon types=search  (source=netease)
-//   - 歌词 / 封面   : Tonzhon types=lyric / types=pic
-//   - 播放直链      : 按来源路由至各自官方后端，均直取真实可播 CDN：
-//                     ① 网易云 → weapi song/enhance/player/url（纯 JS AES-128-CBC，零外部依赖，桌面/移动端通用）
-//                     ② 腾讯QQ → musicu.fcg vkey.GetVkeyServer (CgiGetVkey)，实测 12/12 可播
-//                     ③ 酷狗   → wwwapi.kugou.com play/getdata
-//                     各后端失败均 best-effort 回退：按歌名匹配网易云 id 走 weapi。
-// 说明：网易云免费外链 outer/url 近期大面积限制，故网易云改用 weapi；QQ/酷狗亦各自直连官方取链端点。
+// ��Ҫ�¸� (xiage) MusicFree ��� �� ��ˣ�ͭ�� Tonzhon (https://tonzhon.com)
+// ȫ��·ͳһ�� Tonzhon ��Դ (https://tonzhon.com/api.php)��
+//   - �赥/���а�  : Tonzhon types=playlist��������/�ṷ/QQ ��Դ��
+//   - ����          : Tonzhon types=search  (source=netease)
+//   - ��� / ����   : Tonzhon types=lyric / types=pic
+//   - ����ֱ��      : ����Դ·�������Թٷ���ˣ���ֱȡ��ʵ�ɲ� CDN��
+//                     �� ������ �� weapi song/enhance/player/url���� JS AES-128-CBC�����ⲿ����������/�ƶ���ͨ�ã�
+//                     �� ��ѶQQ �� musicu.fcg vkey.GetVkeyServer (CgiGetVkey)��ʵ�� 12/12 �ɲ�
+//                     �� �ṷ   �� wwwapi.kugou.com play/getdata
+//                     �����ʧ�ܾ� best-effort ���ˣ�������ƥ�������� id �� weapi��
+// ˵����������������� outer/url ���ڴ�������ƣ��������Ƹ��� weapi��QQ/�ṷ�����ֱ���ٷ�ȡ���˵㡣
 //
-// ⚠️ 已知后端限制（Tonzhon 实测）：
-//   - 汽水(qishui)/抖音：Tonzhon 无此源，静默回退网易云，无法提供真实汽水内容。
-//   - 酷我(kuwo)/百度(baidu)：Tonzhon 的 types=playlist 对这两源返回空(0字节)，无法提供歌单/榜单。
-//   - QQ 官方巅峰榜 disstid 在 Tonzhon 上已变更（仅返回"今日私享"类算法歌单），故 QQ 分组采用已验证可返回的精选/每日榜单。
-//   - 酷狗歌单名 Tonzhon 不返回，分组标题为人工标注。
+// ?? ��֪������ƣ�Tonzhon ʵ�⣩��
+//   - ��ˮ(qishui)/������Tonzhon �޴�Դ����Ĭ���������ƣ��޷��ṩ��ʵ��ˮ���ݡ�
+//   - ����(kuwo)/�ٶ�(baidu)��Tonzhon �� types=playlist ������Դ���ؿ�(0�ֽ�)���޷��ṩ�赥/�񵥡�
+//   - QQ �ٷ��۷�� disstid �� Tonzhon ���ѱ����������"����˽��"���㷨�赥������ QQ �����������֤�ɷ��صľ�ѡ/ÿ�հ񵥡�
+//   - �ṷ�赥�� Tonzhon �����أ��������Ϊ�˹���ע��
 //
-// 返回值结构严格遵循 MusicFree 插件协议：
+// ����ֵ�ṹ�ϸ���ѭ MusicFree ���Э�飺
 //  - getTopLists       -> IMusicSheetGroupItem[] = [{ title, data: IMusicSheetItem[] }]
 //  - getTopListDetail  -> { isEnd, musicList: IMusicItem[] }
 //  - getMusicSheetInfo -> { isEnd, musicList: IMusicItem[] }
 //  - search            -> { isEnd, data: IMusicItem[] }
 //  - importMusicSheet  -> IMusicItem[]
 //  - importMusicItem   -> IMusicItem
-//  - getMediaSource    -> { url }（已解析为可播直链）
+//  - getMediaSource    -> { url }���ѽ���Ϊ�ɲ�ֱ����
 //  - getLyric          -> { rawLrc }
 //
-// ===== 跨加载器协议兼容（关键）=====
-// MusicFree 存在两种插件加载协议：
-//   (A) 新协议 CommonJS：沙箱注入 module/exports，期望 `module.exports = {...}`；
-//   (B) 老协议 `return ${funcCode}`：把整段源码当表达式返回对象，且不注入 module/exports。
-// 若插件只写 `module.exports = {...}`，在老协议加载器下 `module` 未定义 → ReferenceError → 安装报“插件无法解析”。
-// 故本插件整体包为 IIFE 表达式，既用 module.exports 兼容(A)，其返回值又兼容(B)，并用 typeof 安全取 require。
+// ===== �������Э����ݣ��ؼ���=====
+// MusicFree �������ֲ������Э�飺
+//   (A) ��Э�� CommonJS��ɳ��ע�� module/exports������ `module.exports = {...}`��
+//   (B) ��Э�� `return ${funcCode}`��������Դ�뵱����ʽ���ض����Ҳ�ע�� module/exports��
+// �����ֻд `module.exports = {...}`������Э��������� `module` δ���� �� ReferenceError �� ��װ��������޷���������
+// �ʱ���������Ϊ IIFE ����ʽ������ module.exports ����(A)���䷵��ֵ�ּ���(B)������ typeof ��ȫȡ require��
 (function () {
-  // ---- 安全获取 require（兼容两种沙箱注入名）----
+  // ---- ��ȫ��ȡ require����������ɳ��ע������----
   var reqFn = (
     typeof __musicfree_require !== 'undefined' ? __musicfree_require :
     (typeof require !== 'undefined' ? require : null)
   );
   if (!reqFn) {
-    throw new Error('[xiage] 插件沙箱未提供 require，无法加载');
+    throw new Error('[xiage] ���ɳ��δ�ṩ require���޷�����');
   }
   var axios = reqFn('axios');
-  // 用 qs 构造 query string（避免沙箱未注入的 URLSearchParams）；若 qs 不可用则回退手动拼接
+  // �� qs ���� query string������ɳ��δע��� URLSearchParams������ qs ������������ֶ�ƴ��
   var qs = (function () { try { return reqFn('qs'); } catch (e) { return null; } })();
 
-  // ===== 铜钟 Tonzhon 音源后端（歌单/搜索/歌词）=====
+  // ===== ͭ�� Tonzhon ��Դ��ˣ��赥/����/��ʣ�=====
   var TZ = 'https://tonzhon.com/api.php';
-  // 网易云 weapi 播放端点（直取可播 CDN，绕开已失效的 outer/url 外链）
+  // ������ weapi ���Ŷ˵㣨ֱȡ�ɲ� CDN���ƿ���ʧЧ�� outer/url ������
   var NETEASE_WEAPI = 'https://music.163.com/weapi/song/enhance/player/url/v1?csrf_token=';
 
   var UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-  // ===== 平台歌单/榜单定义（ID 均经 Tonzhon 实测可返回曲目）=====
+  // ===== ƽ̨�赥/�񵥶��壨ID ���� Tonzhon ʵ��ɷ�����Ŀ��=====
 
-  // 网易云官方排行榜（稳定 ID）
+  // �����ƹٷ����а��ȶ� ID��
   var NETEASE_RANKS = [
-    { id: '19723756', title: '云音乐飙升榜' },
-    { id: '3779629', title: '云音乐新歌榜' },
-    { id: '3778678', title: '云音乐热歌榜' },
-    { id: '2884035', title: '网易原创歌曲榜' },
-    { id: '2809577409', title: '云音乐欧美新歌榜' },
-    { id: '1978921795', title: '云音乐电音榜' },
-    { id: '3411278', title: '云音乐快手榜' },
-    { id: '1747976524', title: '云音乐怀旧榜' },
-    { id: '6723173524', title: '云音乐网络歌曲榜' }
+    { id: '19723756', title: '�����������' },
+    { id: '3779629', title: '�������¸��' },
+    { id: '3778678', title: '�������ȸ��' },
+    { id: '2884035', title: '����ԭ��������' },
+    { id: '2809577409', title: '������ŷ���¸��' },
+    { id: '1978921795', title: '�����ֵ�����' },
+    { id: '3411278', title: '�����ֿ��ְ�' },
+    { id: '1747976524', title: '�����ֻ��ɰ�' },
+    { id: '6723173524', title: '���������������' }
   ];
 
-  // 酷狗官方排行榜（ID 见社区榜单清单，经 Tonzhon 实测返回曲目）
+  // �ṷ�ٷ����а�ID ���������嵥���� Tonzhon ʵ�ⷵ����Ŀ��
   var KUGOU_RANKS = [
-    { id: '59703', title: '酷狗·蜂鸟流行音乐榜' },
-    { id: '52144', title: '酷狗·抖音热歌榜' },
-    { id: '52767', title: '酷狗·快手热歌榜' },
-    { id: '24971', title: '酷狗·DJ热歌榜' },
-    { id: '31308', title: '酷狗·内地榜' }
+    { id: '59703', title: '�ṷ�������������ְ�' },
+    { id: '52144', title: '�ṷ�������ȸ��' },
+    { id: '52767', title: '�ṷ�������ȸ��' },
+    { id: '24971', title: '�ṷ��DJ�ȸ��' },
+    { id: '31308', title: '�ṷ���ڵذ�' }
   ];
 
-  // QQ音乐歌单（Tonzhon 上官方巅峰榜 disstid 已变更，采用已验证可返回的精选/每日榜单）
+  // QQ���ָ赥��Tonzhon �Ϲٷ��۷�� disstid �ѱ������������֤�ɷ��صľ�ѡ/ÿ�հ񵥣�
   var QQ_RANKS = [
-    { id: '7013848675', title: 'QQ音乐·【ACG治愈】即使孤单也要温柔' },
-    { id: '7021611886', title: 'QQ音乐·影魔炎的今日私享' }
+    { id: '7013848675', title: 'QQ���֡���ACG��������ʹ�µ�ҲҪ����' },
+    { id: '7021611886', title: 'QQ���֡�Ӱħ�׵Ľ���˽��' }
   ];
 
-  // 热门歌单·网易云（已验证可返回曲目的精选歌单）
+  // ���Ÿ赥�������ƣ�����֤�ɷ�����Ŀ�ľ�ѡ�赥��
   var NETEASE_HOT = [
-    { id: '3136952023', title: '网易云·私人雷达' },
-    { id: '528437612', title: '网易云·圆神电音' },
-    { id: '3778679', title: '网易云·CNBLUE 热门50单曲' }
+    { id: '3136952023', title: '�����ơ�˽���״�' },
+    { id: '528437612', title: '�����ơ�Բ�����' },
+    { id: '3778679', title: '�����ơ�CNBLUE ����50����' }
   ];
 
-  // 热门歌单·酷狗（ID 经 Tonzhon 实测返回曲目；歌单名 Tonzhon 不返回，人工标注）
+  // ���Ÿ赥���ṷ��ID �� Tonzhon ʵ�ⷵ����Ŀ���赥�� Tonzhon �����أ��˹���ע��
   var KUGOU_HOT = [
-    { id: '709458', title: '酷狗热门精选①' },
-    { id: '125032', title: '酷狗热门精选②' },
-    { id: '123', title: '酷狗热门大歌单(500首)' }
+    { id: '709458', title: '�ṷ���ž�ѡ��' },
+    { id: '125032', title: '�ṷ���ž�ѡ��' },
+    { id: '123', title: '�ṷ���Ŵ�赥(500��)' }
   ];
 
-  // 热门歌单·QQ音乐（已验证可返回曲目）
+  // ���Ÿ赥��QQ���֣�����֤�ɷ�����Ŀ��
   var QQ_HOT = [
-    { id: '7021611884', title: 'QQ音乐·犯二才是青春的今日私享' },
-    { id: '7021611885', title: 'QQ音乐·字' }
+    { id: '7021611884', title: 'QQ���֡����������ഺ�Ľ���˽��' },
+    { id: '7021611885', title: 'QQ���֡���' }
   ];
 
-  // ===== Tonzhon api.php 统一 POST 封装 =====
+  // ===== Tonzhon api.php ͳһ POST ��װ =====
   function tzPost(types, extra) {
     var data = Object.assign({ types: types }, extra || {});
     var keys = Object.keys(data);
@@ -124,7 +124,7 @@
       .then(function (r) { return r.data; });
   }
 
-  // 歌手字段扁平化：Tonzhon 搜索返回 [["周杰伦,温岚"]]，网易云返回 [{name}]
+  // �����ֶα�ƽ����Tonzhon �������� [["�ܽ���,���"]]�������Ʒ��� [{name}]
   function flattenArtist(a) {
     if (!a) return '';
     if (typeof a === 'string') return a;
@@ -141,16 +141,16 @@
     return '';
   }
 
-  // ===== 网易云 weapi 播放端点（纯 JS AES-128-CBC 实现，无任何外部依赖，桌面/移动端沙箱通用）=====
-  // 加密为 AES-128-CBC（两次）+ RSA；为最大化沙箱可移植性（避免依赖 crypto-js/big-integer，桌面/移动端通用），
-  // 此处采用纯 JS 实现：AES 自实现，RSA 采用【固定 secKey + 预计算 encSecKey 常量】规避运行时大数运算。
+  // ===== ������ weapi ���Ŷ˵㣨�� JS AES-128-CBC ʵ�֣����κ��ⲿ����������/�ƶ���ɳ��ͨ�ã�=====
+  // ����Ϊ AES-128-CBC�����Σ�+ RSA��Ϊ���ɳ�����ֲ�ԣ��������� crypto-js/big-integer������/�ƶ���ͨ�ã���
+  // �˴����ô� JS ʵ�֣�AES ��ʵ�֣�RSA ���á��̶� secKey + Ԥ���� encSecKey �������������ʱ�������㡣
   var WEAPI_NONCE = '0CoJUm6Qyw8W8jud';
   var WEAPI_IV = '0102030405060708';
-  var WEAPI_SEC_KEY = '0CoJUm6Qyw8W8jud'; // 固定外层 AES 密钥（第三方客户端通用做法）
+  var WEAPI_SEC_KEY = '0CoJUm6Qyw8W8jud'; // �̶���� AES ��Կ���������ͻ���ͨ��������
   var WEAPI_ENC_SEC_KEY =
-    'bf50d0bcf56833b06d8d1219496a452a1d860fd58a14c0aafba3e770104ca77dc6856cb310ed3309039e6865081be4ddc2df52663373b20b70ac25b4d0c6ca466daef6b50174e93536e2d580c49e70649ad1936584899e85722eb83ceddfb4f56c1172fca5e60592d0e6ee3e8e02be1fe6e53f285b0389162d8e6ddc553857cd'; // RSA(reversed(SEC_KEY)) 预计算常量
+    'bf50d0bcf56833b06d8d1219496a452a1d860fd58a14c0aafba3e770104ca77dc6856cb310ed3309039e6865081be4ddc2df52663373b20b70ac25b4d0c6ca466daef6b50174e93536e2d580c49e70649ad1936584899e85722eb83ceddfb4f56c1172fca5e60592d0e6ee3e8e02be1fe6e53f285b0389162d8e6ddc553857cd'; // RSA(reversed(SEC_KEY)) Ԥ���㳣��
 
-  // --- 纯 JS AES-128-CBC（PKCS7）---
+  // --- �� JS AES-128-CBC��PKCS7��---
   var _SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16];
   var _RCON = [0x01000000,0x02000000,0x04000000,0x08000000,0x10000000,0x20000000,0x40000000,0x80000000,0x1b000000,0x36000000];
   function _subWord(w){return (_SBOX[(w>>>24)&0xff]<<24)|(_SBOX[(w>>>16)&0xff]<<16)|(_SBOX[(w>>>8)&0xff]<<8)|_SBOX[w&0xff];}
@@ -168,12 +168,12 @@
     return { params: p2, encSecKey: WEAPI_ENC_SEC_KEY };
   }
 
-  // 直连网易云 weapi 取播放直链（返回 http(s) CDN；下架/变灰曲返回 null）
+  // ֱ�������� weapi ȡ����ֱ�������� http(s) CDN���¼�/��������� null��
   function getNeteaseUrl(id) {
     try {
       var payload = JSON.stringify({ ids: '[' + id + ']', level: 'standard', encodeType: 'mp3', csrf_token: '' });
       var enc = weapiEncrypt(payload);
-      // 构造 params/encSecKey 表单（沙箱未注入 URLSearchParams，改用 qs 或手动拼接）
+      // ���� params/encSecKey ������ɳ��δע�� URLSearchParams������ qs ���ֶ�ƴ�ӣ�
       var reqBody = 'params=' + encodeURIComponent(enc.params) + '&encSecKey=' + encodeURIComponent(enc.encSecKey);
       return axios
         .post(NETEASE_WEAPI, reqBody, {
@@ -197,7 +197,7 @@
     return String(u).replace(/^http:\/\//i, 'https://');
   }
 
-  // 尝试从 Tonzhon types=url 取自有音源直链（当前对全部音源返回空，故多数为 null）
+  // ���Դ� Tonzhon types=url ȡ������Դֱ������ǰ��ȫ����Դ���ؿգ��ʶ���Ϊ null��
   function tzAudioUrl(id, source) {
     try {
       return tzPost('url', { id: String(id), source: source || 'netease' }).then(function (r) {
@@ -215,7 +215,7 @@
     }
   }
 
-  // 用歌名 best-effort 匹配网易云 id（用于非网易源歌曲的播放/歌词回退）
+  // �ø��� best-effort ƥ�������� id�����ڷ�����Դ�����Ĳ���/��ʻ��ˣ�
   function matchNeteaseByQuery(name, artist) {
     if (!name) return Promise.resolve(null);
     function tryQuery(q) {
@@ -232,8 +232,8 @@
     });
   }
 
-  // ===== 腾讯QQ 音频后端：musicu.fcg vkey.GetVkeyServer (CgiGetVkey) =====
-  // 经实测：QQ 官方取链接口，无需登录即可返回真实可播直链（aqqmusic.tc.qq.com/...?vkey=...）。
+  // ===== ��ѶQQ ��Ƶ��ˣ�musicu.fcg vkey.GetVkeyServer (CgiGetVkey) =====
+  // ��ʵ�⣺QQ �ٷ�ȡ���ӿڣ������¼���ɷ�����ʵ�ɲ�ֱ����aqqmusic.tc.qq.com/...?vkey=...����
   function getQQUrl(mid) {
     if (!mid) return Promise.resolve(null);
     try {
@@ -274,8 +274,8 @@
     }
   }
 
-  // ===== 酷狗音频后端：wwwapi.kugou.com play/getdata =====
-  // 说明：免费曲可返回 play_url；付费/区域限制曲为空，此时回退网易云匹配。
+  // ===== �ṷ��Ƶ��ˣ�wwwapi.kugou.com play/getdata =====
+  // ˵����������ɷ��� play_url������/����������Ϊ�գ���ʱ����������ƥ�䡣
   function getKugouUrl(hash, albumId) {
     if (!hash) return Promise.resolve(null);
     try {
@@ -299,9 +299,9 @@
     }
   }
 
-  // ===== 各源歌曲映射 =====
+  // ===== ��Դ����ӳ�� =====
 
-  // 网易云：d.playlist.tracks
+  // �����ƣ�d.playlist.tracks
   function mapNeteaseTracks(tracks) {
     return (tracks || []).map(function (t) {
       return {
@@ -318,7 +318,7 @@
     });
   }
 
-  // 酷狗：d.data.info[]，filename 为 "歌手 - 歌名"
+  // �ṷ��d.data.info[]��filename Ϊ "���� - ����"
   function mapKugouTracks(info) {
     return (info || []).map(function (t) {
       var fm = t.filename || '';
@@ -340,7 +340,7 @@
     });
   }
 
-  // QQ音乐：d.data.cdlist[0].songlist[]
+  // QQ���֣�d.data.cdlist[0].songlist[]
   function mapTencentTracks(songlist) {
     return (songlist || []).map(function (s) {
       var singer;
@@ -368,7 +368,7 @@
     });
   }
 
-  // ===== 链接识别（导入）=====
+  // ===== ����ʶ�𣨵��룩=====
   function detectPlatform(input) {
     var s = String(input || '');
     if (/music\.163\.com/.test(s)) {
@@ -385,7 +385,7 @@
     return null;
   }
 
-  // 构建分组（标题/ID 均预置，避免 getTopLists 阶段大量网络请求导致超时）
+  // �������飨����/ID ��Ԥ�ã����� getTopLists �׶δ������������³�ʱ��
   function buildGroup(title, list, src, kindLabel) {
     return {
       title: title,
@@ -403,11 +403,11 @@
     };
   }
 
-    // ===== 插件导出对象 =====
+    // ===== ����������� =====
 
-    // 歌单/榜单详情抓取：提升为 IIFE 自由函数（与 getNeteaseUrl 等并列）。
-    // 关键修复：此前写在 plugin 对象字面量里作为属性，而 getTopListDetail/getMusicSheetInfo
-    // 用裸 _fetchSongs(...) 调用，作用域中无此自由变量 → ReferenceError → 排行榜/歌单详情为空。
+    // �赥/������ץȡ������Ϊ IIFE ���ɺ������� getNeteaseUrl �Ȳ��У���
+    // �ؼ��޸�����ǰд�� plugin ��������������Ϊ���ԣ��� getTopListDetail/getMusicSheetInfo
+    // ���� _fetchSongs(...) ���ã����������޴����ɱ��� �� ReferenceError �� ���а�/�赥����Ϊ�ա�
     function _fetchSongs(sheetItem) {
       if (!sheetItem || sheetItem._kind !== 'tzpl') return Promise.resolve({ songs: [], hasNext: false });
       var src = sheetItem._src;
@@ -437,11 +437,11 @@
       return Promise.resolve({ songs: [], hasNext: false });
     }
 
-    // 试听片段探测：QQ 免费账号对部分曲（含非 VIP 的试听限制曲）经 CgiGetVkey 返回 30s 试听片段，
-    // 仅凭 CgiGetVkey 的 buy 标志无法区分（预览曲与完整曲标志完全相同，见实测），必须以「实际文件大小」判定。
-    // 用 Range GET（bytes=0-0）取响应头 content-range 的 TOTAL 字节数；aqqmusic 等 CDN 对 HEAD 不回 content-length，
-    // 但对 Range GET 稳定回 content-range: bytes 0-0/TOTAL。30s@128kbps≈500KB，完整曲通常≥2MB，阈值取 1.2MB。
-    // 无法判断（请求失败/不支持 Range）时返回 false，绝不误伤完整曲、绝不阻塞播放。
+    // ����Ƭ��̽�⣺QQ ����˺ŶԲ����������� VIP ���������������� CgiGetVkey ���� 30s ����Ƭ�Σ�
+    // ��ƾ CgiGetVkey �� buy ��־�޷����֣�Ԥ��������������־��ȫ��ͬ����ʵ�⣩�������ԡ�ʵ���ļ���С���ж���
+    // �� Range GET��bytes=0-0��ȡ��Ӧͷ content-range �� TOTAL �ֽ�����aqqmusic �� CDN �� HEAD ���� content-length��
+    // ���� Range GET �ȶ��� content-range: bytes 0-0/TOTAL��30s@128kbps��500KB��������ͨ����2MB����ֵȡ 1.2MB��
+    // �޷��жϣ�����ʧ��/��֧�� Range��ʱ���� false�����������������������������š�
     function looksLikePreview(url) {
       if (!url || typeof url !== 'string') return Promise.resolve(false);
       var u = forceHttps(url);
@@ -453,7 +453,7 @@
           validateStatus: function () { return true; }
         })
         .then(function (r) {
-          try { r.data.resume(); } catch (e) { /* 丢弃响应体，仅读头 */ }
+          try { r.data.resume(); } catch (e) { /* ������Ӧ�壬����ͷ */ }
           var cr = r.headers && r.headers['content-range'];
           if (cr) {
             var m = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
@@ -462,18 +462,18 @@
               return total > 0 && total < 1.2 * 1024 * 1024;
             }
           }
-          // 兜底：部分 CDN 不支持 Range 时退用 content-length
+          // ���ף����� CDN ��֧�� Range ʱ���� content-length
           var cl = r.headers && r.headers['content-length'] ? parseInt(r.headers['content-length'], 10) : 0;
           return cl > 0 && cl < 1.2 * 1024 * 1024;
         })
         .catch(function () { return false; });
     }
 
-    // 按歌名+歌手匹配网易云并返回「首个完整」直链（QQ/酷狗 试听或取链失败时的回退，网易云直连不产试听）。
-    // 关键点：网易云搜索结果首位常为官方版但可能已变灰（weapi 返回 url:null），个别匹配到的曲即便返回直链也可能是
-    // 试听片段（实测白月光与朱砂痣 大籽版网易云直链仅 0.94MB ≈ 试听）。故遍历前若干结果，按 Tonzhon 相关度顺序
-    // 逐个取链并排除试听片段（<1.2MB），返回首个「完整」直链；若候选全是试听/变灰，则退回最后一个非空直链（至少能播）。
-    // 实测：慢冷 Live 首位李荣浩版变灰→第 2 名梁静茹版完整 1.5MB 命中；白月光首位试听→继续命中完整版。
+    // ������+����ƥ�������Ʋ����ء��׸�������ֱ����QQ/�ṷ ������ȡ��ʧ��ʱ�Ļ��ˣ�������ֱ��������������
+    // �ؼ��㣺���������������λ��Ϊ�ٷ��浫�����ѱ�ң�weapi ���� url:null��������ƥ�䵽�������㷵��ֱ��Ҳ������
+    // ����Ƭ�Σ�ʵ����¹�����ɰ�� ���Ѱ�������ֱ���� 0.94MB �� ���������ʱ���ǰ���ɽ������ Tonzhon ��ض�˳��
+    // ���ȡ�����ų�����Ƭ�Σ�<1.2MB���������׸���������ֱ��������ѡȫ������/��ң����˻����һ���ǿ�ֱ���������ܲ�����
+    // ʵ�⣺���� Live ��λ���ٺư��ҡ��� 2 ������������� 1.5MB ���У����¹���λ�������������������档
     function getNeteaseUrlForQuery(name, artist) {
       if (!name) return Promise.resolve(null);
       return tzPost('search', { source: 'netease', name: name, pages: 1, count: 8 })
@@ -485,12 +485,12 @@
             var id = it && it.id ? String(it.id) : null;
             if (!id) return p;
             return p.then(function (found) {
-              if (found) return found; // 已找到完整直链，短路后续取链
+              if (found) return found; // ���ҵ�����ֱ������·����ȡ��
               return getNeteaseUrl(id).then(function (u) {
                 if (!u) return null;
-                lastAny = u; // 记录最近一个非空直链，供全试听时兜底
+                lastAny = u; // ��¼���һ���ǿ�ֱ������ȫ����ʱ����
                 return looksLikePreview(u).then(function (isPrev) {
-                  return isPrev ? null : u; // 完整→命中；试听/变灰→继续下一个候选
+                  return isPrev ? null : u; // ���������У�����/��ҡ�������һ����ѡ
                 });
               });
             });
@@ -501,25 +501,25 @@
     }
 
     var plugin = {
-      platform: '我要下歌',
+      platform: '��Ҫ�¸�',
       version: '0.0.14',
     author: 'tianpeng',
-    // 安装/更新地址：jsDelivr 直链（gitee.com/raw 会 302，虽 axios 跟随但直链更稳）
+    // ��װ/���µ�ַ��jsDelivr ֱ����gitee.com/raw �� 302���� axios ���浫ֱ�����ȣ�
     srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-xiage/xiage.js',
     description:
-      '我要下歌(xiage) 音乐插件 · 铜钟Tonzhon音源：网易云/酷狗/QQ 排行榜与热门歌单，搜索/歌词走 tonzhon.com，播放按来源路由至官方后端——网易云 weapi / 腾讯QQ CgiGetVkey / 酷狗 play/getdata，失败回退网易云匹配',
+      '��Ҫ�¸�(xiage) ���ֲ�� �� ͭ��Tonzhon��Դ��������/�ṷ/QQ ���а������Ÿ赥������/����� tonzhon.com�����Ű���Դ·�����ٷ���ˡ��������� weapi / ��ѶQQ CgiGetVkey / �ṷ play/getdata��ʧ�ܻ���������ƥ��',
     cacheControl: 'no-store',
     supportedSearchType: ['music'],
 
-    // ===== 排行榜 / 热门歌单（全部来自 Tonzhon playlist 接口，按平台分组）=====
+    // ===== ���а� / ���Ÿ赥��ȫ������ Tonzhon playlist �ӿڣ���ƽ̨���飩=====
     getTopLists: function () {
       var groups = [];
-      groups.push(buildGroup('网易云排行榜', NETEASE_RANKS, 'netease', '排行榜'));
-      groups.push(buildGroup('酷狗排行榜', KUGOU_RANKS, 'kugou', '排行榜'));
-      groups.push(buildGroup('QQ音乐歌单', QQ_RANKS, 'tencent', '排行榜'));
-      groups.push(buildGroup('热门歌单·网易云', NETEASE_HOT, 'netease', '热门歌单'));
-      groups.push(buildGroup('热门歌单·酷狗', KUGOU_HOT, 'kugou', '热门歌单'));
-      groups.push(buildGroup('热门歌单·QQ音乐', QQ_HOT, 'tencent', '热门歌单'));
+      groups.push(buildGroup('���������а�', NETEASE_RANKS, 'netease', '���а�'));
+      groups.push(buildGroup('�ṷ���а�', KUGOU_RANKS, 'kugou', '���а�'));
+      groups.push(buildGroup('QQ���ָ赥', QQ_RANKS, 'tencent', '���а�'));
+      groups.push(buildGroup('���Ÿ赥��������', NETEASE_HOT, 'netease', '���Ÿ赥'));
+      groups.push(buildGroup('���Ÿ赥���ṷ', KUGOU_HOT, 'kugou', '���Ÿ赥'));
+      groups.push(buildGroup('���Ÿ赥��QQ����', QQ_HOT, 'tencent', '���Ÿ赥'));
       return Promise.resolve(groups);
     },
 
@@ -537,7 +537,7 @@
       });
     },
 
-    // ===== 搜索（Tonzhon，netease 源）=====
+    // ===== ������Tonzhon��netease Դ��=====
     search: function (query, page, type) {
       page = page || 1;
       if (type && type !== 'music') return Promise.resolve({ isEnd: true, data: [] });
@@ -564,17 +564,17 @@
         .catch(function (e) { return { isEnd: true, data: [] }; });
     },
 
-    // ===== 导入歌单（网易云 / QQ音乐，均经 Tonzhon）=====
+    // ===== ����赥�������� / QQ���֣����� Tonzhon��=====
     importMusicSheet: function (urlLike) {
       var info = detectPlatform(urlLike);
       if (!info) {
-        return Promise.reject(new Error('无法识别的歌单链接，请粘贴网易云(music.163.com)或QQ音乐(y.qq.com)的歌单链接'));
+        return Promise.reject(new Error('�޷�ʶ��ĸ赥���ӣ���ճ��������(music.163.com)��QQ����(y.qq.com)�ĸ赥����'));
       }
       if (info.server === 'netease') {
         return tzPost('playlist', { id: info.id, source: 'netease' }).then(function (d) {
           var tracks = (d && d.playlist && d.playlist.tracks) || [];
           if (!tracks.length) {
-            throw new Error('该网易云歌单未返回曲目，通常为私人/需登录歌单；请在网易云网页端将其设为「公开」后再导入');
+            throw new Error('�������Ƹ赥δ������Ŀ��ͨ��Ϊ˽��/���¼�赥��������������ҳ�˽�����Ϊ�����������ٵ���');
           }
           return mapNeteaseTracks(tracks);
         });
@@ -583,18 +583,18 @@
         return tzPost('playlist', { id: info.id, source: 'tencent' }).then(function (d) {
           var cd = (d && d.data && d.data.cdlist) || [];
           var sl = cd.length ? cd[0].songlist || [] : [];
-          if (!sl.length) throw new Error('该QQ歌单未解析到歌曲，可能链接有误或已失效（或需登录）');
+          if (!sl.length) throw new Error('��QQ�赥δ���������������������������ʧЧ�������¼��');
           return mapTencentTracks(sl);
         });
       }
-      return Promise.reject(new Error('暂不支持该平台的歌单导入'));
+      return Promise.reject(new Error('�ݲ�֧�ָ�ƽ̨�ĸ赥����'));
     },
 
-    // ===== 导入单曲（网易云可靠；QQ best-effort）=====
+    // ===== ���뵥���������ƿɿ���QQ best-effort��=====
     importMusicItem: function (urlLike) {
       var info = detectPlatform(urlLike);
       if (!info) {
-        return Promise.reject(new Error('无法识别的歌曲链接，请粘贴网易云或QQ音乐的歌曲链接'));
+        return Promise.reject(new Error('�޷�ʶ��ĸ������ӣ���ճ�������ƻ�QQ���ֵĸ�������'));
       }
       if (info.server === 'netease') {
         return Promise.resolve({
@@ -623,20 +623,20 @@
           _artist: ''
         });
       }
-      return Promise.reject(new Error('暂不支持该平台的单曲导入'));
+      return Promise.reject(new Error('�ݲ�֧�ָ�ƽ̨�ĵ�������'));
     },
 
-    // ===== 播放直链（按来源路由至各自官方后端；失败 best-effort 匹配网易云）=====
+    // ===== ����ֱ��������Դ·�������Թٷ���ˣ�ʧ�� best-effort ƥ�������ƣ�=====
     getMediaSource: function (musicItem) {
-      // ① 网易源：weapi 直取真实可播 CDN
+      // �� ����Դ��weapi ֱȡ��ʵ�ɲ� CDN
       if (musicItem._nzId) {
         return getNeteaseUrl(musicItem._nzId).then(function (url) {
           if (url) return { url: forceHttps(url) };
           return _fallback(musicItem);
         });
       }
-      // ② 腾讯QQ 源：官方 CgiGetVkey 取链。免费账号对 VIP/付费曲返回 30s 试听，
-      //    故探测文件大小，疑似试听则回退网易云完整版（完整 QQ 曲仍走 QQ，保留原格式）。
+      // �� ��ѶQQ Դ���ٷ� CgiGetVkey ȡ��������˺Ŷ� VIP/���������� 30s ������
+      //    ��̽���ļ���С��������������������������棨���� QQ ������ QQ������ԭ��ʽ����
       if (musicItem._qqMid) {
         return getQQUrl(musicItem._qqMid).then(function (url) {
           if (!url) {
@@ -650,7 +650,7 @@
           });
         });
       }
-      // ③ 酷狗源：官方 play/getdata 取链；失败回退网易云匹配
+      // �� �ṷԴ���ٷ� play/getdata ȡ����ʧ�ܻ���������ƥ��
       if (musicItem._kgHash) {
         return getKugouUrl(musicItem._kgHash, musicItem._kgAlbum).then(function (url) {
           if (url) return { url: forceHttps(url) };
@@ -664,10 +664,10 @@
       return _fallback(musicItem);
     },
 
-    // ===== 歌词（Tonzhon lyric 接口，netease）=====
+    // ===== ��ʣ�Tonzhon lyric �ӿڣ�netease��=====
     getLyric: function (musicItem) {
       var lyricId = musicItem._lyricId || musicItem._nzId;
-      // 非网易源：best-effort 匹配网易云 id 取歌词
+      // ������Դ��best-effort ƥ�������� id ȡ���
       function fetchLyric(id) {
         if (!id) return Promise.resolve({ rawLrc: '', translation: '' });
         return tzPost('lyric', { id: id, source: 'netease' })
@@ -685,28 +685,28 @@
     }
   };
 
-  // 统一兜底：先尝试自有音源（若未来复活），否则抛错
+  // ͳһ���ף��ȳ���������Դ����δ������������״�
   function _fallback(musicItem) {
     var fallbackId = musicItem._nzId || musicItem._qqMid || musicItem._kgHash;
     if (fallbackId) {
       var src = musicItem._source || (musicItem._qqMid ? 'tencent' : musicItem._kgHash ? 'kugou' : 'netease');
       return tzAudioUrl(fallbackId, src).then(function (tz) {
         if (tz) return { url: tz };
-        throw new Error('该歌曲暂无可用的播放音源（QQ/酷狗/网易云后端均未返回直链；付费或区域限制曲可能无解，或匹配未命中）');
+        throw new Error('�ø������޿��õĲ�����Դ��QQ/�ṷ/�����ƺ�˾�δ����ֱ�������ѻ����������������޽⣬��ƥ��δ���У�');
       });
     }
-    return Promise.reject(new Error('该歌曲暂无可用的播放音源（QQ/酷狗/网易云后端均未返回直链；付费或区域限制曲可能无解，或匹配未命中）'));
+    return Promise.reject(new Error('�ø������޿��õĲ�����Դ��QQ/�ṷ/�����ƺ�˾�δ����ֱ�������ѻ����������������޽⣬��ƥ��δ���У�'));
   }
 
-  // ===== 跨加载器导出 =====
-  // (A) 新协议 CommonJS：写入 module.exports
+  // ===== ����������� =====
+  // (A) ��Э�� CommonJS��д�� module.exports
   if (typeof module !== 'undefined' && module && module.exports) {
     module.exports = plugin;
   }
-  // (B) 部分环境导出到 exports
+  // (B) ���ֻ��������� exports
   if (typeof exports !== 'undefined') {
     exports.default = plugin;
   }
-  // (C) 老协议 `return ${funcCode}`：本 IIFE 作为表达式被返回，下面是返回值
+  // (C) ��Э�� `return ${funcCode}`���� IIFE ��Ϊ����ʽ�����أ������Ƿ���ֵ
   return plugin;
 })();
