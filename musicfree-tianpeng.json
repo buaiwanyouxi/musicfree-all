@@ -6,57 +6,64 @@
       "name": "我要下歌",
       "platform": "xiage",
       "version": "0.0.14",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-xiage/xiage.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-xiage/undefined",
       "id": 1
     },
     {
       "name": "布谷音乐",
       "platform": "buguyy",
       "version": "0.0.5",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-buguyy/buguyy.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-buguyy/undefined",
       "id": 2
     },
     {
       "name": "QQ音乐",
       "platform": "QQ音乐",
-      "version": "0.0.1",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qq/qq.js",
+      "version": "0.1.10",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qq/undefined",
       "id": 3
     },
     {
       "name": "网易云音乐",
       "platform": "网易云音乐",
-      "version": "0.0.1",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-wy/wy.js",
+      "version": "0.1.4",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-wy/undefined",
       "id": 4
     },
     {
       "name": "酷我",
       "platform": "酷我",
-      "version": "0.0.1",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kw/kw.js",
+      "version": "0.0.2",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kw/undefined",
       "id": 5
     },
     {
       "name": "酷狗",
       "platform": "酷狗",
-      "version": "0.0.9",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kg/kg.js",
+      "version": "0.1.5",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-kg/undefined",
       "id": 6
     },
     {
       "name": "汽水音乐",
       "platform": "汽水音乐",
       "version": "0.0.1",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qs/qs.js",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-qs/undefined",
       "id": 7
     },
     {
       "name": "哔哩哔哩",
       "platform": "Bilibili",
-      "version": "V0.0.8",
-      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-bilibili/bilibili.js",
+      "version": "V0.0.10",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-bilibili/undefined",
       "id": 8
+    },
+    {
+      "name": "TP百度网盘",
+      "platform": "TP百度网盘",
+      "version": "0.1.11",
+      "url": "https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@main/musicfree-baidu/baidu.js",
+      "id": 9
     }
   ]
 }
