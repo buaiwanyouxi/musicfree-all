@@ -415,6 +415,34 @@
     return { url: j[0].url || j[0].downlink, headers: { 'User-Agent': YW_UA } };
   }
 
+  // ---- 试听/铃声短片段闸门（2026-11-16 对齐 qq.js/xiage.js）----
+  // 背景：酷我系聚合站（凤梨/溜声等）对部分条目回吐铃声/试听片段（实测「Letting Go」75KB≈12s，
+  //   car-bj.kuwo.cn/…/lx/resource/*.aac），原逻辑只看有无 url 即放行 → 用户听到 12s 无效音频。
+  // 判定：Range GET(bytes=0-0) 读资产总字节（content-range 总量优先、200 的 content-length 兜底），
+  //   期望时长已知 → 低于「16kbps 半量线」（秒数×2000 字节）判短片段；未知 → 退 1.2MB 绝对阈值（xiage.js 同口径）。
+  function isPreviewBytes(total, expectMs) {
+    if (!total || total < 8192) return false;            // 无法判定（含 206 仅回 range 长度）→ 不误杀
+    if (expectMs > 0) return total < (expectMs / 1000) * 2000;
+    return total < 1.2 * 1024 * 1024;
+  }
+  async function urlIsPreview(url, expectMs) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', Referer: 'https://www.kuwo.cn/', Range: 'bytes=0-0' },
+        timeout: 4000, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var total = 0;
+      if (r.status >= 200 && r.status < 300) {
+        var cr = (r.headers && r.headers['content-range']) || '';
+        var mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        if (mc) total = parseInt(mc[1], 10);
+        else if (r.status === 200 && r.headers && r.headers['content-length']) total = parseInt(r.headers['content-length'], 10) || 0; // 206 的 content-length 仅 range 长度
+      }
+      return isPreviewBytes(total, expectMs);
+    } catch (e) { return false; } // 探测异常不误杀
+  }
+
   // 兜底编排：官方代理优先 → 依次尝试备选源（每源经 kwPick 身份校验）
   var KW_BACKUPS = [
     { name: '无忧音乐网', search: qeSearch, url: qeUrl },
@@ -459,7 +487,11 @@
         for (var j = 0; j < Math.min(ordered.length, 3); j++) {
           try {
             var res = await b.url(ordered[j].id);
-            if (res && res.url) { hit = res; break; }
+            if (res && res.url) {
+              // 【2026-11-16】试听/铃声短片段闸门：片段换下一候选，不再把 12s 无效音频交给播放器
+              if (await urlIsPreview(res.url, musicItem && musicItem.duration)) { lastErr = '试听/铃声短片段，已拒绝'; continue; }
+              hit = res; break;
+            }
             lastErr = '空链接';
           } catch (e2) { lastErr = e2.message; }
         }
@@ -492,9 +524,14 @@
       const url = PROXY_BASE + '/kw.php?id=' + encodeURIComponent(songId) + '&level=' + encodeURIComponent(apiLevel) + '&type=mp3';
       // 官方代理第一优先：轻量可达性探测（仅读响应头，不下载音频体），失败则兜底
       try {
-        const probe = await fetchT(url, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const probe = await fetchT(url, { method: 'GET', redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0', Range: 'bytes=0-0' } });
         const ct = (probe.headers && probe.headers.get && probe.headers.get('content-type')) || '';
-        if ((probe.status === 200 || probe.status === 206) && /^audio|video\/mp4|application\/octet-stream/i.test(ct)) {
+        // 【2026-11-16】试听短片段闸门：读 content-range 总量（酷我 VIP 曲代理可能回 30s 试听片段）
+        const cr = (probe.headers && probe.headers.get && probe.headers.get('content-range')) || '';
+        const mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        const cl = (probe.headers && probe.headers.get && probe.headers.get('content-length')) || '';
+        const total = mc ? parseInt(mc[1], 10) : ((probe.status === 200 && cl) ? parseInt(cl, 10) : 0);
+        if ((probe.status === 200 || probe.status === 206) && /^audio|video\/mp4|application\/octet-stream/i.test(ct) && !isPreviewBytes(total, musicItem && musicItem.duration)) {
           return { url: url };
         }
       } catch (e) { /* 代理不可达，走兜底 */ }
@@ -838,11 +875,11 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '酷我',
-    version: '0.0.4',
+    version: '0.0.5',
     author: 'tianpeng',
     description: '酷我音源：支持歌单导入、热门歌单、官方排行榜，附带搜索/歌词/专辑/歌手。' +
       '取链使用社区代理 music.nxinxz.com（酷我官方免费接口已失效）。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.0.4/musicfree-kw/github/kw.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.0.5/musicfree-kw/github/kw.js',
     cacheControl: 'no-cache',
     hints: {
       importMusicSheet: [
@@ -861,6 +898,11 @@
     },
     getMediaSource: getMediaSource,
     _backups: KW_BACKUPS, // 调试/测试用：暴露内联备选源清单
+    _internal: {
+      // 【2026-11-16】试听/铃声短片段闸门（供单测）
+      isPreviewBytes: isPreviewBytes,
+      urlIsPreview: urlIsPreview,
+    },
     getMusicInfo: getMusicInfo,
     getAlbumInfo: getAlbumInfo,
     getLyric: getLyric,
