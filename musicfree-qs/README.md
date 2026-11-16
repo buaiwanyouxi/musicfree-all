@@ -1,6 +1,6 @@
 # 汽水音乐音源插件（qs.js）使用说明
 
-> **平台**：汽水音乐（字节系 Qishui / Luna）｜ **版本**：v0.0.6 ｜ **作者**：tianpeng
+> **平台**：汽水音乐（字节系 Qishui / Luna）｜ **版本**：v0.0.7 ｜ **作者**：tianpeng
 > **适配**：[MusicFree](https://github.com/maotoumao/MusicFree) 桌面端 / 移动端
 
 ---
