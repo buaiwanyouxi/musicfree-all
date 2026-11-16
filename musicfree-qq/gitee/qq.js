@@ -679,7 +679,7 @@
           if (d.lrc) lrcCacheSet(musicItem, d.lrc);
           var u = safeUrl(d.url);
           if (u && onMatch) onMatch(u); // 记录次优链（已过滤 HLS/非法链）
-          if (u && await validatePlayable(u, signal)) return { url: u }; // 不带 Referer（否则 CDN 403）
+          if (u && await validatePlayable(u, signal, musicItem && musicItem.duration)) return { url: u }; // 不带 Referer（否则 CDN 403）
           lastErr = d && d.msg ? String(d.msg) : '空链接';
         }
       } catch (e) { lastErr = e.message; }
@@ -837,7 +837,7 @@
           if (d.lrc) prefetchSiteLrc(d.lrc, musicItem);
           var u = safeUrl(d.url);
           if (u && onMatch) onMatch(u); // 记录次优链（已过滤 HLS/非法链）
-          if (u && await validatePlayable(u, signal)) return { url: u };
+          if (u && await validatePlayable(u, signal, musicItem && musicItem.duration)) return { url: u };
           lastErr = d.msg ? String(d.msg) : '空链接';
         }
       } catch (e) { lastErr = e.message; }
@@ -1083,8 +1083,8 @@
         var d = await src.getUrl(ordered[i].id, quality, signal);
         var u = d && d.url ? safeUrl(d.url) : null;
         if (u && onMatch) onMatch(u);                       // 记录次优链（供整段超时兜底）
-        if (u && await validatePlayable(u, signal)) return { url: u };
-        lastErr = '空链接或不可播';
+          if (u && await validatePlayable(u, signal, musicItem && musicItem.duration)) return { url: u };
+          lastErr = '空链接或不可播';
       } catch (e) { lastErr = e.message; }
     }
     throw new Error(src.name + '可取链候选均不可播（' + (lastErr || '无可用链接') + '）');
@@ -1103,7 +1103,19 @@
   // 播放前“可播放性”实时探测（兜底安全网）：仅当响应【明确不是音频】(404/403 或 text/html) 才判不可用，
   // 让上层继续走下一个兜底源；网络错误(超时/DNS/Abort)则“信任放行”，避免误杀本可播放的链。
   // 这样即便某 CDN 节点对错误 vkey 回 HTML，也绝不会把崩溃性 URL 交给原生播放器。
-  async function validatePlayable(url, signal) {
+  // 【v0.1.13】试听/铃声短片段闸门：Range 请求同一响应头读资产总字节（content-range 总量优先、
+  //   200 的 content-length 兜底），低于阈值判「试听短片段」并拒绝，由调用方换下一候选/下一源。
+  //   背景（真机复现）：凤梨等酷我系聚合站对部分条目回吐铃声/试听片段（实测「Letting Go(那英&蔡健雅 Live)」
+  //   资产 75KB≈12s，car-bj.kuwo.cn/…/lx/resource/*.aac），旧逻辑只看状态码+content-type 全部放行 →
+  //   用户听到 12s 无效音频。参考 xiage.js 的 looksLikePreview（<1.2MB 判试听）补此缺口。
+  //   阈值口径：期望时长已知 → 按「16kbps 半量线」（秒数×2000 字节）判——实测 75KB/12s 铃声低于线 9 倍、
+  //   30s@128kbps 试听（480KB）同样拦截；而 24kbps 低码率全曲仍有 1.5 倍余量不误杀。期望时长未知 → 退 1.2MB 绝对阈值（xiage.js 同口径）。
+  function isPreviewBytes(total, expectMs) {
+    if (!total || total < 8192) return false;            // 无法判定（含 206 仅回 range 长度）→ 不误杀
+    if (expectMs > 0) return total < (expectMs / 1000) * 2000;
+    return total < 1.2 * 1024 * 1024;
+  }
+  async function validatePlayable(url, signal, expectMs) {
     if (!url || typeof url !== 'string') return false;
     try {
       var r = await axios.get(url, {
@@ -1112,6 +1124,14 @@
       });
       var st = r.status;
       var ct = (r.headers && r.headers['content-type']) || '';
+      var total = 0;
+      if (st >= 200 && st < 300) {
+        var cr = (r.headers && r.headers['content-range']) || '';
+        var mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        if (mc) total = parseInt(mc[1], 10);
+        else if (st === 200 && r.headers && r.headers['content-length']) total = parseInt(r.headers['content-length'], 10) || 0; // 206 的 content-length 仅 range 长度，不作总量
+      }
+      if (isPreviewBytes(total, expectMs)) return false;   // 试听/铃声短片段：拒绝，换下一候选
       if (st >= 200 && st < 300 && /audio|video|application\/octet-stream/i.test(ct)) return true;
       // 【v0.1.3】未跟随到底的重定向（如 aax 的 s.5bb3.com/*.m4a 会 302 到酷我 car-bj.kuwo.cn/*.aac）
       // 一律信任放行：它已证明「路径存在且可跳转」，交原生播放器自行跟随；否则会把可播链误杀成播放失败。
@@ -1387,7 +1407,7 @@
         if (u) {
           var su = safeUrl(u);
           if (su && onMatch) onMatch(su);
-          if (su && await validatePlayable(su, signal)) return { url: su };
+          if (su && await validatePlayable(su, signal, musicItem && musicItem.duration)) return { url: su };
           lastErr = '空链接/不可播';
         }
       } catch (e) { lastErr = e.message; }
@@ -1636,7 +1656,7 @@
         .then(function (official) {
           var u = official ? safeUrl(official) : null;
           if (!u) return null;
-          return validatePlayable(u, signal).then(function (ok) { return ok ? { url: u } : null; });
+          return validatePlayable(u, signal, musicItem && musicItem.duration).then(function (ok) { return ok ? { url: u } : null; });
         })
         .catch(function () { return null; });
       // ⑤ 高优先备用：音乐搜索神器（music.lmb520.cn，跨平台聚合；实测 netease/kuwo/kugou 可取链）
@@ -1704,7 +1724,7 @@
       // onMatch、位于 validatePlayable 之前，可能已失效）；复验不过照常抛错，不再 fail-open 放行坏链。
       if (bestSoFar) {
         var bfUrl = (bestSoFar && typeof bestSoFar === 'object') ? bestSoFar.url : bestSoFar; // 兼容 {url} 与纯字符串两种结构，只复验 url
-        if (bfUrl && await validatePlayable(bfUrl, signal)) return finish({ url: bfUrl });
+        if (bfUrl && await validatePlayable(bfUrl, signal, musicItem && musicItem.duration)) return finish({ url: bfUrl });
       }
       throw new Error('《' + name + '》官方取链失败，且备用音源（音乐搜索神器 / GD音乐台 / MyFreeMP3 / aax / mvmp3 / qeecc / 歌曲海 / 歌曲客 / 凤梨 / 溜声 / 我要下歌）均未取得：' + (errs.join('；') || '未知原因') +
         '。备用源提示“验证失败”多为站点临时升级，稍后重试即可；极冷门曲多源均可能无匹配。');
@@ -2089,17 +2109,18 @@
 
   module.exports = {
     platform: 'QQ音乐',
-    version: '0.1.12',
+    version: '0.1.13',
     author: 'tianpeng',
     description: 'QQ音乐（腾讯系）音源：搜索/歌词/排行榜/热门歌单/歌单导入（均走免签旧版 cgi-bin 端点）。' +
       '【取链 12 路并发竞速】官方 QQ(CgiGetVkey，Cookie 解锁登录态曲目) 3s 抢跑 + 11 个备用源分层竞速：' +
       '组0 GD音乐台/MyFreeMP3 独占 1.2s 出线窗 → 组1 aax/mvmp3/qeecc/歌曲海/歌曲客/凤梨/溜声/我要下歌（8 源，窗口后首出即用）→ 组2 音乐搜索神器（与 sq.js 同源，仅最后兜底）；' +
       '【三态身份校验】歌名+歌手双因子判定（v0.1.8 起取消时长参与判定），缺失≠通过、不符即拒，防同名异版错播；' +
+      '【短片段闸门】v0.1.13 取链响应读资产总字节（content-range/length），不足期望时长一半（32kbps 口径）判试听/铃声短片段拒绝换候选，杜绝「12s 无效音频」；' +
       '【软熔断+每日探活】备用源连续失败自动组内降权、成功即复位；每日首播前 HEAD 探活预判可达性（只记快照）；' +
       '【缓存】URL 5min（LRU 100 条、按音质分槽）/ 歌词 30min，重复播放 0ms 命中，搜索/歌单详情返回后预取前 3 首；' +
       '【歌词三级兜底】①QQ 官方 → ②取链时顺带缓存的同源歌词 → ③按歌名+歌手在备用源并发反查（过滤占位/水印歌词）；' +
       '整段 9s 软上限（超时中止在途请求），全败时返回已通过身份校验且复验可播的最佳链。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.12/musicfree-qq/github/qq.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.13/musicfree-qq/github/qq.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     userVariables: [
@@ -2155,7 +2176,8 @@
       splitDashTitle: splitDashTitle, // 【v0.1.3】「歌手 - 歌名」+「MM:SS」拆分
       mvIsVerify: mvIsVerify,
       siteIsVerify: siteIsVerify,     // 【v0.1.3】站点人机验证页判定
-      validatePlayable: validatePlayable, // 【v0.1.3】可播放性探测（含 3xx 信任分支）
+      validatePlayable: validatePlayable, // 【v0.1.3】可播放性探测（含 3xx 信任分支；v0.1.13 含短片段体积闸门，expectMs=期望毫秒时长）
+      isPreviewBytes: isPreviewBytes,     // 【v0.1.13】短片段判定（总字节 vs 期望时长），供单测
       raceFirstUrl: raceFirstUrl,         // 【v0.1.6】备用源首出即用竞速（软优先 aax→mvmp3→qeecc）
       // 【v0.1.6 第二批】播放链缓存 + 预取（仅供单测访问；真机由 getMediaSource/search 内部调用）
       urlCacheGet: urlCacheGet,
