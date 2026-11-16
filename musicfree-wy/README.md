@@ -1,6 +1,6 @@
 # 网易云音乐音源插件（wy.js）使用说明
 
-> **平台**：网易云音乐 ｜ **版本**：v0.1.3 ｜ **作者**：tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)
+> **平台**：网易云音乐 ｜ **版本**：v0.1.14 ｜ **作者**：tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)
 > **适配**：[MusicFree](https://github.com/maotoumao/MusicFree) 桌面端 / 移动端
 
 ---
@@ -22,15 +22,25 @@
 | 热门歌单标签 | `/api/playlist/highquality/tags` |
 | 热门/分类歌单 | `/api/playlist/highquality/list`（cat=分类名） |
 
-### 取链兜底策略（三层）
+### 取链兜底策略（十三层兜底链）
 
-网易云免费曲优先用官方直链（最高音质）；**VIP / 付费曲目免费态仅返回约 30 秒试听片段**（版权限制），插件自动改用备用音源兜底：
+网易云免费曲优先用官方直链（最高音质）；**VIP / 付费曲目免费态仅返回约 30 秒试听片段**（版权限制），插件自动改用十三层备用兜底链（全程三态身份校验，无安全候选即拒绝错播，最大化「有歌可播」且防错播）：
 
-1. **【首选】无名音乐网 mvmp3.com**：自动完成「我不是人机」验证并缓存 50 分钟，无需手动操作；
-2. **【次选】歌曲宝 gequbao.com**：无需验证，作为 mvmp3 自动过验证偶发失败时的自动兜底；
-3. **【三级兜底】布谷音乐 buguyy.top**：直连真实 API（不继承其官方 BASE 误写 jsdelivr 的既有 bug），返回媒体不带 Referer（规避酷我 CDN 403），作为前两层均失败时的最后兜底。
+1. **【①】无名音乐网 mvmp3.com**：自动完成「我不是人机」验证并缓存 50 分钟，无需手动操作；
+2. **【②】歌曲宝 gequbao.com**：无需验证（当前接口 `/search-fallback` + JWT `play_id` + `purpose=play`），作为 mvmp3 自动过验证偶发失败时的自动兜底；
+3. **【③】无忧音乐网 qeecc.com**：自动过验证 + 会话缓存 50 分钟，返回酷我 CDN 直链；
+4. **【④】歌曲海 gequhai.com**：`play_id` + 会话 cookie 取酷我直链；
+5. **【⑤】歌曲客 gequke.com**：同歌曲海基线（`/song/` 路径）取酷我直链；
+6. **【⑥】凤梨音乐 flmp3.pro**：酷我 CDN 直链；
+7. **【⑦】溜声音乐 6sing.top**：酷我 CDN 直链（http 站点）；
+8. **【⑧】GD音乐台 gdstudio**：免登录聚合 API（网易云 / Joox）；
+9. **【⑨】MyFreeMP3**：网易云后端，列表自带直链 + 歌词；
+10. **【⑩】我要下歌 xiage**：Tonzhon 源，网易云直链；
+11. **【⑪】音乐搜索神器 lmb520**：netease / qq / kugou / kuwo 多平台聚合；
+12. **【⑫】小蜜蜂 xmfwav / 音微 yinwe**：独立站同名替身（跨平台通用）；
+13. **【⑬】布谷音乐 buguyy.top**：直连真实 API（不继承其官方 BASE 误写 jsdelivr 的既有 bug），返回媒体不带 Referer（规避酷我 CDN 403），作为前十二层均失败时的极端末位兜底。
 
-> 参考 `kugou_mvmp3.js` 思路实现。会员 Cookie 可让官方 VIP 曲返回完整链（最高音质）。
+> 参考 `kugou_mvmp3.js` 思路实现；酷我系 5 源（③④⑤⑥⑦）为主力兜底，aax 实测 0 结果暂不接入。会员 Cookie 可让官方 VIP 曲返回完整链（最高音质）。
 
 ---
 
@@ -39,8 +49,8 @@
 | 功能 | 方法 | 说明 |
 |------|------|------|
 | 搜索 | `search` | 单曲 / 歌单（music/sheet） |
-| 播放取链 | `getMediaSource` | 官方直链 + 三层备用兜底 |
-| 歌词 | `getLyric` | 官方 + 备用源兜底 |
+| 播放取链 | `getMediaSource` | 官方直链 + 十三层备用兜底链 |
+| 歌词 | `getLyric` | 官方 + 备用源兜底（含 MyFreeMP3 / 音乐搜索神器歌词） |
 | 排行榜 | `getTopLists` / `getTopListDetail` | 官方 63 个榜单 |
 | 热门歌单 | `getRecommendSheetTags` / `getRecommendSheetsByTag` | 精选/分类歌单（highquality） |
 | 歌单导入 | `importMusicSheet` | 粘贴网易云歌单链接/ID |
