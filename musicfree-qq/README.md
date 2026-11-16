@@ -1,6 +1,6 @@
 # QQ音乐音源插件（qq.js）使用说明
 
-> **平台**：QQ音乐（腾讯系）｜ **版本**：v0.1.12 ｜ **作者**：tianpeng
+> **平台**：QQ音乐（腾讯系）｜ **版本**：v0.1.13 ｜ **作者**：tianpeng
 > **适配**：[MusicFree](https://github.com/maotoumao/MusicFree) 桌面端 / 移动端
 
 ---
