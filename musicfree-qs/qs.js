@@ -180,6 +180,33 @@
   function isClip(durSec, expectMs) {
     return !!(expectMs > 0 && durSec > 0 && durSec * SEC_TO_MS < expectMs * 0.5);
   }
+  // 【2026-11-16】试听/铃声短片段字节闸门：资产时长元数据缺失（durSec=0）时的兜底判定，
+  //   与 qq.js/kg.js/kw.js/wy.js 同口径——Range GET(bytes=0-0) 读资产总字节（content-range 总量优先、
+  //   200 的 content-length 兜底），低于「16kbps 半量线」（秒数×2000 字节）判短片段；未知退 1.2MB 绝对阈值。
+  //   背景（真机复现）：酷我系聚合站对部分条目回吐铃声/试听片段（「Letting Go」75KB≈12s，
+  //   car-bj.kuwo.cn/…/lx/resource/*.aac），仅凭元数据时长无法拦截 durSec 缺失的条目。
+  function isPreviewBytes(total, expectMs) {
+    if (!total || total < 8192) return false;            // 无法判定（含 206 仅回 range 长度）→ 不误杀
+    if (expectMs > 0) return total < (expectMs / 1000) * 2000;
+    return total < 1.2 * 1024 * 1024;
+  }
+  async function urlIsPreview(url, expectMs) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': CHROME_UA, Referer: 'https://www.douyin.com/', Range: 'bytes=0-0' },
+        timeout: 4000, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var total = 0;
+      if (r.status >= 200 && r.status < 300) {
+        var cr = (r.headers && r.headers['content-range']) || '';
+        var mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        if (mc) total = parseInt(mc[1], 10);
+        else if (r.status === 200 && r.headers && r.headers['content-length']) total = parseInt(r.headers['content-length'], 10) || 0; // 206 的 content-length 仅 range 长度
+      }
+      return isPreviewBytes(total, expectMs);
+    } catch (e) { return false; } // 探测异常不误杀
+  }
   async function getMediaSource(musicItem, quality) {
     var d, tp;
     try {
@@ -206,7 +233,12 @@
     //   （容差 max(15s, 期望20%)，且不得仍是短片段），命中即换用，最多验证 3 个候选。
     //   全部候选仍为片段（曲库仅有片段授权）时保留原链路并告警，宁可短片段也不拒播。
     var expectMs = musicItem && musicItem.duration;
-    if (isClip(pk.durSec, expectMs)) {
+    // 【2026-11-16】时长元数据缺失（durSec=0）时 isClip 无法判定 → 退字节闸门兜底（Range 读总字节）
+    var clipByBytes = false;
+    if (!isClip(pk.durSec, expectMs) && !(pk.durSec > 0) && expectMs > 0 && pk.url) {
+      clipByBytes = await urlIsPreview(pk.url, expectMs);
+    }
+    if (isClip(pk.durSec, expectMs) || clipByBytes) {
       var expectSec = expectMs / SEC_TO_MS;
       var myId = String(musicItem.id);
       var myArtist = (musicItem.artist || '').trim();
@@ -237,6 +269,7 @@
             if (!tp2) continue;
             var pk2 = await pickPlayable(tp2);
             if (!pk2.url || isClip(pk2.durSec, expectMs)) continue;                    // 仍是片段
+            if (!(pk2.durSec > 0) && (await urlIsPreview(pk2.url, expectMs))) continue; // 【2026-11-16】时长缺失退字节闸门：仍是片段
             if (pk2.durSec > 0 && Math.abs(pk2.durSec - expectSec) > Math.max(15, expectSec * 0.2)) continue; // 时长仍不符
             console.warn('[qs] 短片段换完整版: ' + musicItem.title + ' id ' + myId + ' 资产 ' + pk.durSec + 's -> id ' + cand.id + ' 资产 ' + pk2.durSec + 's (' + (cand.artist || '?') + ')');
             pk = pk2;
@@ -403,11 +436,11 @@
 
   var plugin = {
     platform: '汽水音乐',
-    version: '0.0.6',
+    version: '0.0.7',
     author: 'tianpeng',
     description: '汽水音乐（字节 Luna）音源：搜索/取链/歌词/排行榜/歌单/热门歌单。' +
       '搜索、取链、歌词、排行榜、歌单导入、按标签热门歌单均可免签调用（v0.0.6 修复热门歌单空白与歌单曲目为空）。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.0.6/musicfree-qs/github/qs.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.0.7/musicfree-qs/github/qs.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
     primaryKey: ['id'],
@@ -442,6 +475,9 @@
     _internal: {
       formatTrack: formatTrack,
       parsePlaylistId: parsePlaylistId,
+      // 【2026-11-16】试听/铃声短片段闸门（供单测）
+      isPreviewBytes: isPreviewBytes,
+      urlIsPreview: urlIsPreview,
     },
   };
 
