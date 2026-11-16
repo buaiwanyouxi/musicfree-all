@@ -1,5 +1,4 @@
-// 酷狗音乐 v0.1.2 · 发布于 2026-09-28（MusicFree 音源插件发布版）
-// 酷狗音源 + 无名音乐网(mvmp3) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 四层兜底插件
+// 酷狗音源 + 无名音乐网(mvmp3) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 等，官方+14 备用源顺序兜底（共 15 层）插件
 // ---------------------------------------------------------------------------
 // 设计目标：让“无法播放”的场景尽可能被兜住。
 //   - 酷狗官方取链：对大量歌曲当前已返回空 play_url（接口层面失效），仅作为第一优先尝试；
@@ -38,12 +37,24 @@
   );
   if (!reqFn) throw new Error('[kugou-mvmp3] 插件沙箱未提供 require，无法加载');
   var axios = reqFn('axios');
+  var cheerio = reqFn('cheerio');   // 新增内联备选源（gequhai/gequke/fengli/liusheng/小蜜蜂/音微）HTML 解析用
+
+  // 安全 JSON 解析（字符串→对象；已对象则原样返回；解析失败返回 {}）—— 新增备选源统一复用
+  function toObj(x) {
+    if (typeof x === 'string') { try { return JSON.parse(x); } catch (e) { return {}; } }
+    return x || {};
+  }
 
   // 备用源（mvmp3 / gequbao / aax）单请求超时（统一 ≤3000ms，与 qq.js v0.1.x 一致）
   var KG_SRC_TIMEOUT = 3000;
+  // 站点会话有效期（mvmp3 / aax / 无忧 共用 50 分钟，小于站点 1 小时有效期，留余量）
+  var SESSION_TTL = 50 * 60 * 1000;
 
   // ============================ 酷狗（官方逻辑） ============================
   var KG_PAGE_SIZE = 20;
+  // play/getdata 固定参数（魔数常量化）
+  var KG_API_APPID = '1014';
+  var KG_API_MID = '56bbbd2918b95d6975f420f96c5c29bb';
   var KG_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/106.0.0.0 Safari/537.36',
     'Accept': '*/*',
@@ -71,6 +82,7 @@
   async function searchMusic(query, page) {
     const res = (await axios.get('http://mobilecdn.kugou.com/api/v3/search/song', {
       headers: KG_HEADERS,
+      timeout: 5000,
       params: { format: 'json', keyword: query, page: page, pagesize: KG_PAGE_SIZE, showtype: 1 },
     })).data;
     const info = (res.data && res.data.info) || [];
@@ -84,11 +96,12 @@
   async function kugouGetMediaSource(musicItem) {
     const res = (await axios.get('https://wwwapi.kugou.com/yy/index.php', {
       headers: KG_HEADERS,
+      timeout: 5000,
       params: {
         r: 'play/getdata',
         hash: musicItem.id,
-        appid: '1014',
-        mid: '56bbbd2918b95d6975f420f96c5c29bb',
+        appid: KG_API_APPID,
+        mid: KG_API_MID,
         album_id: musicItem.album_id,
         album_audio_id: musicItem.album_audio_id,
         _: Date.now(),
@@ -126,7 +139,7 @@
   var _mvCookie = null;          // 已通过验证的会话 Cookie（完整形态）
   var _mvCookieAt = 0;           // 获取时间戳
   var _mvCookieUser = false;     // 是否来自用户变量（true 时失效不自动重过）
-  var MV_COOKIE_TTL = 50 * 60 * 1000; // 50 分钟（小于站点 1 小时有效期，留余量）
+  var MV_COOKIE_TTL = SESSION_TTL; // 50 分钟（小于站点 1 小时有效期，留余量）
 
   // 自动完成“我不是人机”软验证：GET / 取会话+csrf → POST / 提交 human_check=on
   async function autoVerify() {
@@ -162,7 +175,7 @@
   function mvIsVerify(html) { return /安全人机验证|我不是人机|verifyForm/.test(html || ''); }
 
   function mvParseItems(html) {
-    var $ = require('cheerio').load(html);
+    var $ = cheerio.load(html);
     var items = [];
     var seen = {};
     $('.play_list li').each(function (i, el) {
@@ -177,6 +190,7 @@
       var ta = (a.text() || '').replace(/\s+/g, ' ').trim();
       var artist = '', title = ta;
       var idx = ta.indexOf(' - ');
+      // 拆分语义：歌手 - 歌名（indexOf 取第一个 ' - '：左侧歌手、右侧歌名）
       if (idx > 0) { artist = ta.substring(0, idx).trim(); title = ta.substring(idx + 3).trim(); }
       items.push({ id: id, title: title, artist: artist });
     });
@@ -215,6 +229,7 @@
     var sb = b >= 1000 ? b / 1000 : b;
     return Math.abs(sa - sb) <= (tol || 3);
   }
+  // 仅测试钩子（时长不参与生产判定）
   function durState(cand, musicItem) {            // 【v0.1.8】保留未引用：当前校验口径已取消时长，函数留存以备扩展
     var a = musicItem && musicItem.duration, b = cand && cand.duration;
     if (!a || !b) return 'unknown';
@@ -264,6 +279,31 @@
     var scored = pool.slice().sort(function (a, b) { return matchScore(b, musicItem) - matchScore(a, musicItem); });
     recordScore(musicItem, all, scored);
     if (!scored.length) return null;
+    return scored;
+  }
+  // 【歌词专用】宽松选池（2026-11-16 修复「部分歌单可播放但不显示歌词」）：
+  //   歌词链原与取链共用严格 pickOrdered，复杂曲名（如「歌名 (深情DJ版)(副标题)」多段括注）或候选歌手
+  //   与目标不一致时，候选被「拒绝错播」整体拦下；取链尚有 15 层备选可换源命中，歌词链仅 5 层 → 歌词全空。
+  //   歌词场景错配风险远低于取链（同名曲歌词通常一致）：严格池为空时退到「歌名匹配」池——歌手不否决，
+  //   同歌手优先 + matchScore 择优。取链路径不使用本函数，防错播约束不放松。
+  function pickOrderedForLyric(items, musicItem) {
+    var strict = pickOrdered(items, musicItem);
+    if (strict && strict.length) return strict;
+    var t = norm(musicItem && musicItem.title);
+    if (!t) return null;
+    var myAr = (musicItem && musicItem.artist) || '';
+    var pool = (items || []).filter(function (c) { return titleOk(c, musicItem); });
+    if (!pool.length) return null;
+    var scored = pool.slice().sort(function (a, b) {
+      var d = matchScore(b, musicItem) - matchScore(a, musicItem);
+      if (d) return d;
+      var aa = artistMatch(norm(myAr), norm(a.artist)) ? 0 : 1;
+      var ba = artistMatch(norm(myAr), norm(b.artist)) ? 0 : 1;
+      return aa - ba;
+    });
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('[kg 歌词] 严格池拒绝错播为空，宽松池（歌名匹配）候选 ' + scored.length + ' 个，取 ' + (scored[0].title || scored[0].id));
+    }
     return scored;
   }
   // 结构化打分明细：记录候选总数 / 选中项 / 全候选打分，写入 _kgScoreLog 并输出可读日志（第四批要求）。
@@ -347,7 +387,7 @@
     var items;
     try { items = await mvSearch(kw, cookie); } catch (e) { return { rawLrc: '' }; }
     if (!items.length) return { rawLrc: '' };
-    var ordered = pickOrdered(items, musicItem);
+    var ordered = pickOrderedForLyric(items, musicItem);
     if (!ordered) return { rawLrc: '' };
     for (var i = 0; i < Math.min(ordered.length, 3); i++) {
       try { var d = await mvPlayUrl(ordered[i].id, cookie); if (d && d.lrc) return { rawLrc: d.lrc }; } catch (e) {}
@@ -374,13 +414,10 @@
     return parts.join('; ');
   }
   function gbExtractPlayId(html) {
-    var m = html.match(/window\.appData\s*=\s*JSON\.parse\('([\s\S]*?)'\)/);
+    // 新站结构：play_id 以 JSON 转义形式内嵌于页面（"play_id\u0022:\u0022eyJ..."），旧 window.appData 已失效
+    var m = html.match(/play_id\\u0022:\\u0022(eyJ[A-Za-z0-9+/=]+)/);
     if (!m) return null;
-    try {
-      var raw = m[1].replace(/\\u0022/g, '"').replace(/\\u0027/g, "'").replace(/\\\\/g, '\\');
-      var obj = JSON.parse(raw);
-      return obj && obj.play_id ? obj.play_id : null;
-    } catch (e) { return null; }
+    return m[1];
   }
   function gbParseItems(html) {
     var items = [], seen = {};
@@ -391,6 +428,7 @@
       seen[id] = 1;
       var ta = m[2] || '', title = ta, artist = '';
       var idx = ta.lastIndexOf(' - ');
+      // 拆分语义：歌名 - 歌手（lastIndexOf 取最后一个 ' - '：左侧歌名、右侧歌手）
       if (idx > 0) { title = ta.substring(0, idx).trim(); artist = ta.substring(idx + 3).trim(); }
       items.push({ id: id, title: title, artist: artist });
     }
@@ -407,7 +445,7 @@
     var cookie = gbExtractCookie(r);
     var playId = gbExtractPlayId(r.data);
     if (!playId) throw new Error('歌曲宝无法解析播放令牌（页面结构可能已变更）');
-    var r2 = await axios.post(GB_BASE + '/member/common-play-url', 'id=' + encodeURIComponent(playId), {
+    var r2 = await axios.post(GB_BASE + '/member/common-play-url', 'id=' + encodeURIComponent(playId) + '&purpose=play', {
       headers: { 'User-Agent': GB_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': pageUrl, 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json, text/javascript, */*', 'Cookie': cookie },
       timeout: KG_SRC_TIMEOUT,
       validateStatus: function () { return true; },
@@ -417,7 +455,7 @@
     throw new Error('歌曲宝取链失败：' + (d && d.msg ? d.msg : JSON.stringify(d)));
   }
   async function gbSearch(keyword) {
-    var r = await gbGetHtml(GB_BASE + '/s/' + encodeURIComponent(keyword || ''), null);
+    var r = await gbGetHtml(GB_BASE + '/search-fallback?keyword=' + encodeURIComponent(keyword || ''), null);
     return gbParseItems(r.data);
   }
   async function gbGetLyric(musicId) {
@@ -440,7 +478,7 @@
   var AAX_BASE = 'https://www.aax.cx';
   var AAX_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
   var _aaxCookie = null, _aaxCookieAt = 0, _aaxCookieUser = false;
-  var AAX_COOKIE_TTL = 50 * 60 * 1000; // 50 分钟（站点会话约 1 小时，留余量）
+  var AAX_COOKIE_TTL = SESSION_TTL; // 50 分钟（站点会话约 1 小时，留余量）
   async function aaxAutoVerify() {
     var r1 = await axios.get(AAX_BASE + '/', { headers: { 'User-Agent': AAX_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' }, timeout: KG_SRC_TIMEOUT, validateStatus: function () { return true; } });
     var setCk = (r1.headers && r1.headers['set-cookie']) || [];
@@ -475,6 +513,7 @@
       var id = m[1]; if (seen[id]) continue; seen[id] = 1;
       var raw = m[2] || '', title = raw, artist = '';
       var idx = raw.indexOf(' - ');
+      // 拆分语义：歌手 - 歌名（indexOf 取第一个 ' - '：左侧歌手、右侧歌名）
       if (idx > 0) { artist = raw.substring(0, idx).trim(); title = raw.substring(idx + 3).trim(); }
       artist = artist.replace(/^[【\[]+|[】\]]+$/g, '').trim();
       title = title.replace(/^[【\[]+|[】\]]+$/g, '').trim();
@@ -520,7 +559,7 @@
     var cookie; try { cookie = await ensureAaxCookie(); } catch (e) { return { rawLrc: '' }; }
     var items; try { items = await aaxSearch(kw, cookie); } catch (e) { return { rawLrc: '' }; }
     if (!items.length) return { rawLrc: '' };
-    var ordered = pickOrdered(items, musicItem);
+    var ordered = pickOrderedForLyric(items, musicItem);
     if (!ordered) return { rawLrc: '' };
     for (var i = 0; i < Math.min(ordered.length, 3); i++) {
       try { var d = await aaxPlayUrl(ordered[i].id, cookie); if (d && d.lrc) return { rawLrc: d.lrc }; } catch (e) {}
@@ -528,28 +567,301 @@
     return { rawLrc: '' };
   }
 
-  // ============================ 四层组合取链 / 歌词（酷狗 → mvmp3 → gequbao → aax） ============================
+  // ===================== 新增内联备选源（第三批：扩酷我系 + 补网易系/聚合深兜底） =====================
+  // 移植自 muscifree-other 各 standalone 插件与 wy/kw.js，统一改用 axios + cheerio（与 kg 现有 mv/gequbao 一致，可走测试 stub、生产亦可用），
+  // 全部经 pickOrdered 身份校验防错播。kg 内容为酷狗、备选为同名替身（与现有 mvmp3/gequbao 同源逻辑一致，可接受）。
+  // 链序：官方(软熔断) → mvmp3② → 歌曲宝③ → 酷我系5(歌曲海/歌曲客/凤梨/溜声/无忧)④-⑧ → 网易系4(GD/MyFree/我要下歌/音乐搜索神器)⑨-⑫ → 独立站2(小蜜蜂/音微)⑬ → aax⑭末位。
+  // aax 退化（本轮 0 结果）置极端末位 ⑭，不阻断播放。
+
+  // ---- 酷我系：无忧音乐网 qeecc.com（自动过验证，酷我 CDN 直链）----
+  var QE_BASE = 'https://www.qeecc.com', QE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  var _qeCk = null, _qeAt = 0;
+  function qeIsVerify(h) { return /安全人机验证|我不是人机|verifyForm/.test(h || ''); }
+  function qeParse(html) {
+    var items = [], seen = {};
+    var re = /<a\s+href="\/song\/([A-Za-z0-9_\-]+)\.html"[^>]*>([^<]*)<\/a>/gi, m;
+    while ((m = re.exec(html))) {
+      var id = m[1]; if (seen[id]) continue; seen[id] = 1;
+      var txt = (m[2] || '').replace(/&nbsp;/g, ' ').replace(/\s*\[[^\]]*\]\s*$/, '').trim();
+      var artist = '', title = txt;
+      var mm = txt.match(/^([\s\S]*?)《([\s\S]*?)》\s*$/);
+      if (mm) { artist = mm[1].trim(); title = mm[2].trim(); }
+      else { var idx = txt.indexOf(' - '); if (idx > 0) { artist = txt.slice(0, idx).trim(); title = txt.slice(idx + 3).trim(); } }
+      if (title) items.push({ id: id, title: title, artist: artist });
+    }
+    return items;
+  }
+  async function qeAutoVerify() {
+    var r1 = await axios.get(QE_BASE + '/', { headers: { 'User-Agent': QE_UA, 'Accept-Language': 'zh-CN,zh;q=0.9' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var sc = (r1.headers && r1.headers['set-cookie']) || ''; var jar = {};
+    String(sc).split(',').forEach(function (c) { var i = c.indexOf('='); if (i > 0) jar[c.slice(0, i).trim()] = c.split(';')[0].split('=').slice(1).join('=').trim(); });
+    var ck = Object.keys(jar).map(function (k) { return k + '=' + jar[k]; }).join('; ');
+    if (!ck) throw new Error('无忧音乐网：无法建立会话');
+    var html = r1.data || ''; if (!qeIsVerify(html)) return ck;
+    var m = html.match(/name="csrf_token" value="([^"]+)"/); var csrf = m ? m[1] : '';
+    await axios.post(QE_BASE + '/', 'csrf_token=' + encodeURIComponent(csrf) + '&human_check=on', { headers: { 'User-Agent': QE_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': QE_BASE + '/', 'Cookie': ck }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    return ck;
+  }
+  async function qeCookie(force) { var now = Date.now(); if (!force && _qeCk && (now - _qeAt) < SESSION_TTL) return _qeCk; var f = await qeAutoVerify(); _qeCk = f; _qeAt = now; return f; }
+  async function qeSearch(kw) {
+    var ck = await qeCookie(false);
+    var r = await axios.get(QE_BASE + '/so/' + encodeURIComponent(kw || '') + '.html', { headers: { 'User-Agent': QE_UA, 'Accept-Language': 'zh-CN,zh;q=0.9', 'Cookie': ck }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    return qeParse(r.data || '');
+  }
+  async function qeUrl(item) {
+    var ck = await qeCookie(false);
+    var r = await axios.post(QE_BASE + '/js/play.php', 'id=' + encodeURIComponent(item.id) + '&type=music', { headers: { 'User-Agent': QE_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest', 'Referer': QE_BASE + '/song/' + item.id + '.html', 'Cookie': ck }, timeout: 9000, validateStatus: function () { return true; } });
+    var t = r.data; var d; try { d = toObj(t); } catch (e) { throw new Error('无忧音乐网：取链非JSON'); }
+    if (!d || !d.url) throw new Error('无忧音乐网：无链接' + (d && d.msg ? '（' + d.msg + '）' : ''));
+    return { url: d.url, headers: { 'User-Agent': QE_UA } };
+  }
+
+  // ---- 酷我系：歌曲海 gequhai.com / 歌曲客 gequke.com（同构站点，cfg 参数化消除逐行重复）----
+  var GH_BASE = 'https://www.gequhai.com', GH_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  function ghCookie(sh) { if (!sh) return ''; return String(sh).split(',').map(function (s) { return s.split(';')[0]; }).join('; '); }
+  var GK_BASE = 'https://www.gequke.com', GK_UA = GH_UA;
+  // gh/gk 仅基址/歌页路径/报错前缀不同，统一走 gkStyle*（cfg: base/ua/name/itemPath/itemRe）
+  var GH_CFG = { base: GH_BASE, ua: GH_UA, name: '歌曲海', itemPath: '/play/', itemRe: /\/play\/(\d+)/ };
+  var GK_CFG = { base: GK_BASE, ua: GK_UA, name: '歌曲客', itemPath: '/song/', itemRe: /\/song\/(\d+)/ };
+  async function gkStyleSearch(cfg, kw) {
+    var r = await axios.get(cfg.base + '/search?s=' + encodeURIComponent(kw), { headers: { 'User-Agent': cfg.ua }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var $ = cheerio.load(r.data || ''); var data = [];
+    $('a.text-info.font-weight-bold').each(function (i, el) {
+      var a = $(el); var href = a.attr('href') || ''; var m = href.match(cfg.itemRe); if (!m) return;
+      var id = m[1], title = a.text().trim(), artist = '';
+      var tr = a.closest('tr');
+      if (tr.length) { var tds = tr.find('td'); var titleTd = a.closest('td'); var idx = tds.index(titleTd); if (idx >= 0 && idx + 1 < tds.length) artist = tds.eq(idx + 1).text().trim() || ''; }
+      if (title) data.push({ id: id, title: title, artist: artist });
+    });
+    return data;
+  }
+  async function gkStyleUrl(cfg, item) {
+    var dres = await axios.get(cfg.base + cfg.itemPath + item.id, { headers: { 'User-Agent': cfg.ua }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var text = dres.data || ''; var pm = text.match(/window\.play_id\s*=\s*'([^']+)'/); if (!pm) throw new Error(cfg.name + '：无play_id');
+    var playId = pm[1], cookie = ghCookie(dres.headers && dres.headers['set-cookie']);
+    var resp = await axios.post(cfg.base + '/api/music', 'id=' + encodeURIComponent(playId) + '&type=0', { headers: { 'User-Agent': cfg.ua, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'Http', 'X-Custom-Header': 'Key', 'Referer': cfg.base + cfg.itemPath + item.id, 'Origin': cfg.base, 'Accept': 'application/json, text/javascript, */*; q=0.01', 'Cookie': cookie }, timeout: 9000, validateStatus: function () { return true; } });
+    var j; try { j = toObj(resp.data); } catch (e) { throw new Error(cfg.name + '：解析失败'); }
+    if (!j || j.code !== 200 || !j.data || !j.data.url) throw new Error(cfg.name + '：取链失败' + (j ? '(' + j.code + ')' : ''));
+    return { url: j.data.url, headers: { 'User-Agent': cfg.ua, 'Referer': 'https://www.kuwo.cn/' } };
+  }
+  async function ghSearch(kw) { return gkStyleSearch(GH_CFG, kw); }
+  async function ghUrl(item) { return gkStyleUrl(GH_CFG, item); }
+  async function gkSearch(kw) { return gkStyleSearch(GK_CFG, kw); }
+  async function gkUrl(item) { return gkStyleUrl(GK_CFG, item); }
+
+  // ---- 酷我系：凤梨音乐 flmp3.pro（kuwo CDN 直链）----
+  var FL_BASE = 'https://www.flmp3.pro', FL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  function flReq(url) { return axios.get(url, { headers: { 'User-Agent': FL_UA, 'Referer': FL_BASE + '/', 'X-Requested-With': 'XMLHttpRequest' }, timeout: 10000, validateStatus: function () { return true; } }); }
+  async function flSearch(kw) {
+    var r = await flReq(FL_BASE + '/search.html?keyword=' + encodeURIComponent(kw) + '&page=1');
+    var $ = cheerio.load(r.data || ''); var data = [];
+    $('.list ul li').each(function (i, el) {
+      var a = $(el).find('a').first(); var href = a.attr('href') || ''; var m = href.match(/\/song\/(\d+)\.html/); if (!m) return;
+      var id = m[1], title = a.find('h3').first().text().trim(), artist = a.find('p').first().text().trim();
+      if (title) data.push({ id: id, title: title, artist: artist || '' });
+    });
+    return data;
+  }
+  async function flUrl(item) { var r = await flReq(FL_BASE + '/api/playurl.php?id=' + item.id); var url = String(r.data || '').trim(); if (!/^https?:\/\//.test(url)) throw new Error('凤梨：未解析到直链'); return { url: url, headers: { 'User-Agent': FL_UA } }; } // 不带 Referer：kuwo CDN 对第三方站 Referer 返回 403（见文件头实测教训）
+
+  // ---- 酷我系：溜声音乐 6sing.top（http 站点，kuwo CDN 直链）----
+  var LS_BASE = 'http://www.6sing.top', LS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  function lsParseTitle(raw) {
+    raw = (raw || '').trim(); if (!raw) return { title: '未知歌曲', artist: '' };
+    var title = raw, artist = ''; var NO = /版|伴奏|演奏|Remix|remix|DJ|flac|mp3/i;
+    var pm = raw.match(/[（(]([^）)]*)[）)]/); if (pm && pm[1].length > 0 && pm[1].length <= 5 && !NO.test(pm[1])) artist = pm[1].trim();
+    var di = raw.lastIndexOf('-'); // 拆分语义：歌名-歌手（lastIndexOf 取最后一个连字符：左侧歌名、右侧歌手）
+    if (di >= 0) { var tail = raw.slice(di + 1).trim().replace(/[）)]/g, '').trim(); if (tail && tail.length >= 1 && tail.length <= 10 && !NO.test(tail)) { artist = tail; title = raw.slice(0, di).trim(); } }
+    title = title.replace(/[（(][^）)]*[）)]/g, '').trim(); if (!title) title = raw; return { title: title, artist: artist };
+  }
+  async function lsSearch(kw) {
+    var r = await axios.get(LS_BASE + '/search.html?keyword=' + encodeURIComponent(kw), { headers: { 'User-Agent': LS_UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var $ = cheerio.load(r.data || ''); var data = [];
+    $('a[href^="/detail/"]').each(function (i, el) { var a = $(el); var href = a.attr('href') || ''; var m = href.match(/\/detail\/(\d+)\.html/); if (!m) return; var id = m[1]; var p = lsParseTitle(a.attr('title')); data.push({ id: id, title: p.title, artist: p.artist }); });
+    return data;
+  }
+  async function lsUrl(item) {
+    var resp = await axios.get(LS_BASE + '/api/play.php?id=' + encodeURIComponent(item.id), { headers: { 'User-Agent': LS_UA, 'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest', 'Referer': LS_BASE + '/detail/' + item.id + '.html' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var j; try { j = toObj(resp.data); } catch (e) { throw new Error('溜声：解析失败'); }
+    if (!j || j.code !== '200' || !j.url) throw new Error('溜声：取链失败' + (j ? '(' + j.code + ')' : ''));
+    return { url: j.url, headers: { 'User-Agent': LS_UA, 'Referer': 'https://www.kuwo.cn/' } };
+  }
+
+  // ---- 网易系：GD音乐台 music-api.gdstudio.xyz（免登录聚合 API，网易云/Joox）----
+  var GD_BTWAF = '99801110'; // GD音乐台接口固定 btwaf 参数（魔数常量化）
+  var GD_API = 'https://music-api.gdstudio.xyz/api.php?btwaf=' + GD_BTWAF;
+  var GD_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+  var GD_SRCS = ['netease', 'joox'];
+  function gdParseItems(raw, src) {
+    var d = toObj(raw); if (Object.prototype.toString.call(d) !== '[object Array]') return [];
+    var out = [];
+    d.forEach(function (it) { if (!it || !it.name || it.id === undefined || it.id === null) return; out.push({ id: src + ':' + String(it.id), title: it.name, artist: (Array.isArray(it.artist) ? it.artist.join('、') : (it.artist || '')), duration: (function (v) { var n = Number(v); if (!isFinite(n) || n <= 0) return undefined; return n < 1000 ? n * 1000 : n; })(it.duration) }) });
+    return out;
+  }
+  async function gdSearch(kw) {
+    var lists = await Promise.all(GD_SRCS.map(function (src) {
+      return axios.get(GD_API, { params: { types: 'search', source: src, name: kw, count: 20, pages: 1 }, headers: { 'User-Agent': GD_UA, 'Accept': 'application/json' }, timeout: 10000, validateStatus: function () { return true; } })
+        .then(function (r) { return gdParseItems(r.data, src); }).catch(function () { return []; });
+    }));
+    var merged = [], seen = {};
+    lists.forEach(function (arr) { arr.forEach(function (it) { var k = String(it.id); if (seen[k]) return; seen[k] = 1; merged.push(it); }); });
+    return merged;
+  }
+  async function gdUrl(item) {
+    var s = String(item.id), i = s.indexOf(':');
+    var src = i > 0 ? s.slice(0, i) : 'netease'; var sid = i > 0 ? s.slice(i + 1) : s;
+    var chain = ['320', '128']; var lastErr = '';
+    for (var j = 0; j < chain.length; j++) {
+      try { var r = await axios.get(GD_API, { params: { types: 'url', source: src, id: sid, br: chain[j] }, headers: { 'User-Agent': GD_UA, 'Accept': 'application/json' }, timeout: 10000, validateStatus: function () { return true; } }); var d = toObj(r.data); if (d && d.url) return { url: String(d.url).trim(), headers: { 'User-Agent': GD_UA } }; lastErr = 'br=' + chain[j] + ' 无链接'; } catch (e) { lastErr = e.message; }
+    }
+    throw new Error('GD音乐台 ' + src + '：' + (lastErr || '无可用链接'));
+  }
+
+  // ---- 网易系：MyFreeMP3 myfreemp3.com.cn（聚合搜索，网易云后端，列表自带直链+歌词）----
+  var MF_BASE = 'https://www.myfreemp3.com.cn', MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  async function mfSearch(kw) {
+    var r = await axios.post(MF_BASE + '/', 'input=' + encodeURIComponent(kw) + '&filter=name&page=1&type=netease', { headers: { 'User-Agent': MF_UA, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', 'Referer': MF_BASE + '/' }, timeout: 12000, validateStatus: function () { return true; } });
+    var b = r.data; if (!b || b.code !== 200 || !b.data || !Array.isArray(b.data.list)) return [];
+    return b.data.list.map(function (it) { return { id: String(it.id != null ? it.id : it.songid), title: it.title || '未知', artist: it.author || '', _url: it.url || '', _lrc: it.lrc || '' }; });
+  }
+  async function mfUrl(item) {
+    var outer = item && (item._url || item.url); if (!outer) throw new Error('MyFreeMP3：缺少播放链接');
+    try {
+      var r = await axios.get(outer, { headers: { 'User-Agent': MF_UA, 'Referer': 'https://music.163.com/' }, maxRedirects: 5, responseType: 'text', timeout: 12000, validateStatus: function () { return true; } });
+      var finalUrl = (r.request && (r.request.res && r.request.res.responseUrl)) || r.config.url;
+      if (finalUrl && !/404$/.test(finalUrl) && !/\/404(\?|$)/.test(finalUrl)) return { url: finalUrl, headers: { 'User-Agent': MF_UA } };
+    } catch (e) {}
+    throw new Error('MyFreeMP3：该曲目暂不可播放(资源不可用)');
+  }
+  async function mfGetLyric(musicItem) {
+    try { var items = await mfSearch(musicItem.title || ''); var ordered = pickOrderedForLyric(items, musicItem); if (!ordered) return { rawLrc: '' }; var top = ordered[0]; if (top && top._lrc && /^data:text\/plain,/.test(top._lrc)) return { rawLrc: decodeURIComponent(top._lrc.slice('data:text/plain,'.length)) }; } catch (e) {} return { rawLrc: '' };
+  }
+
+  // ---- 网易系：我要下歌 xiage（Tonzhon 源，网易云直链 via url 接口）----
+  var XG_TZ = 'https://tonzhon.com/api.php', XG_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  function xgPost(types, extra) {
+    var data = Object.assign({ types: types }, extra || {}); var parts = []; Object.keys(data).forEach(function (k) { parts.push(k + '=' + encodeURIComponent(data[k])); });
+    return axios.post(XG_TZ, parts.join('&'), { headers: { 'User-Agent': XG_UA, 'Content-Type': 'application/x-www-form-urlencoded', Referer: 'https://tonzhon.com/' }, timeout: 15000, validateStatus: function () { return true; } }).then(function (r) { return r.data; });
+  }
+  function xgFlattenArtist(a) { if (!a) return ''; if (typeof a === 'string') return a; if (Array.isArray(a)) { var out = []; for (var i = 0; i < a.length; i++) { var x = a[i]; if (typeof x === 'string') out.push(x); else if (Array.isArray(x)) out.push(x.join('/')); else if (x && x.name) out.push(x.name); } return out.filter(Boolean).join('/'); } return ''; }
+  async function xgSearch(kw) {
+    try { var arr = await xgPost('search', { source: 'netease', name: kw, pages: 1, count: 8 }); if (!Array.isArray(arr)) return []; return arr.map(function (it) { return { id: 'tz_' + String(it.id), title: it.name || '', artist: xgFlattenArtist(it.artist), _nzId: String(it.id) }; }); } catch (e) { return []; }
+  }
+  async function xgUrl(item) {
+    var nid = item && item._nzId; if (!nid) throw new Error('我要下歌：缺少网易云 ID');
+    try { var r = await xgPost('url', { id: nid, source: 'netease' }); var u = r && r.url ? String(r.url).replace(/^http:\/\//i, 'https://') : ''; if (u) return { url: u, headers: { 'User-Agent': XG_UA } }; } catch (e) {}
+    throw new Error('我要下歌：网易云直链获取失败');
+  }
+
+  // ---- 聚合系：音乐搜索神器 music.lmb520.cn（多平台聚合，netease/qq/kugou/kuwo）----
+  var SQ_BASE = 'https://music.lmb520.cn/', SQ_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  var SQ_PLATFORMS = ['netease', 'qq', 'kugou', 'kuwo'];
+  function sqForm(body) { return Object.keys(body).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(body[k]); }).join('&'); }
+  async function sqSearch(kw) {
+    var tasks = SQ_PLATFORMS.map(function (plat) {
+      return axios.post(SQ_BASE, sqForm({ input: kw, filter: 'name', type: plat, page: 1 }), { headers: { 'User-Agent': SQ_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': SQ_BASE, 'X-Requested-With': 'XMLHttpRequest' }, timeout: 10000, validateStatus: function () { return true; } })
+        .then(function (r) { var d = toObj(r.data); if (d.code !== 200 || !Array.isArray(d.data)) return []; return d.data.map(function (it) { return { id: plat + ':' + String(it.songid != null ? it.songid : it.id), title: it.title || '未知', artist: it.author || '', _lrc: it.lrc || '' }; }); }).catch(function () { return []; });
+    });
+    var lists = await Promise.all(tasks); var merged = [], seen = {};
+    lists.forEach(function (arr) { arr.forEach(function (it) { var key = (it.title || '') + '|' + (it.artist || ''); if (!seen[key]) { seen[key] = 1; merged.push(it); } }); });
+    return merged;
+  }
+  async function sqUrl(item) {
+    var info = String(item.id).split(':'); var plat = info.shift(); var sid = info.join(':');
+    var r = await axios.post(SQ_BASE, sqForm({ input: sid, filter: 'id', type: plat, page: 1 }), { headers: { 'User-Agent': SQ_UA, 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': SQ_BASE, 'X-Requested-With': 'XMLHttpRequest' }, timeout: 10000, validateStatus: function () { return true; } });
+    var d = toObj(r.data); var it = (Array.isArray(d.data) && d.data[0]) || {};
+    if (!it.url) throw new Error('音乐搜索神器：无法获取播放链接');
+    return { url: it.url, headers: { 'User-Agent': SQ_UA } }; // 不带 Referer：kuwo CDN 对第三方站 Referer 返回 403（见文件头实测教训）
+  }
+  async function sqGetLyric(musicItem) {
+    try { var items = await sqSearch(musicItem.title || ''); var ordered = pickOrderedForLyric(items, musicItem); if (!ordered) return { rawLrc: '' }; var top = ordered[0]; if (top && top._lrc) return { rawLrc: top._lrc }; } catch (e) {} return { rawLrc: '' };
+  }
+
+  // ---- 独立站末位兜底（跨平台通用同名替身）----
+  var XM_BASE = 'https://www.xmfwav.com', XM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  async function xmSearch(kw) {
+    var r = await axios.get(XM_BASE + '/srcj/?kwd=' + encodeURIComponent(kw || ''), { headers: { 'User-Agent': XM_UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var $ = cheerio.load(r.data || ''); var data = [];
+    $('a.srcsong-item').each(function (i, el) { var a = $(el); var href = a.attr('href') || ''; var m = href.match(/\/song\/(\d+)/); if (!m) return; var id = m[1]; var title = a.find('span.srcsong-name').first().text().trim(); var artist = a.find('span.srcact').first().text().trim(); if (title) data.push({ id: id, title: title, artist: artist || '' }); });
+    return data;
+  }
+  async function xmUrl(item) {
+    var html = (await axios.get(XM_BASE + '/song/' + item.id, { timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } })).data || '';
+    var m = String(html).match(/url:\s*['"]([^'"]+\.(?:mp3|wav|flac|ogg|m4a))['"]/i);
+    if (!m || !/^https?:\/\//.test(m[1])) throw new Error('小蜜蜂：无直链');
+    return { url: m[1], headers: { 'User-Agent': XM_UA } };
+  }
+  var YW_BASE = 'https://www.yinwe.com', YW_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  function ywParseTitle(raw) {
+    raw = (raw || '').trim(); if (!raw) return { title: '未知歌曲', artist: '' };
+    var m = raw.match(/^(.*?)[（(](.+?)[）)]\s*[-\u2013\u2014]?\s*(.*)$/);
+    if (m) return { title: m[1].trim() || raw, artist: m[2].trim() || '' };
+    // 拆分语义：歌名 - 歌手（split 后首段为歌名、其余拼回为歌手）
+    if (raw.indexOf(' - ') >= 0) { var p = raw.split(/\s*-\s*/); return { title: p[0].trim(), artist: p.slice(1).join('-').trim() || '' }; }
+    return { title: raw, artist: '' };
+  }
+  async function ywSearch(kw) {
+    var r = await axios.get(YW_BASE + '/?keyword=' + encodeURIComponent(kw), { headers: { 'User-Agent': YW_UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var $ = cheerio.load(r.data || ''); var data = [];
+    $('a.sp1[href*="/yinyue/"]').each(function (i, el) { var a = $(el); var href = a.attr('href') || ''; var m = href.match(/\/yinyue\/(\d+)\.html/); if (!m) return; var id = m[1]; var p = ywParseTitle(a.attr('title')); data.push({ id: id, title: p.title, artist: p.artist }); });
+    return data;
+  }
+  async function ywUrl(item) {
+    var resp = await axios.get(YW_BASE + '/?plugin=xmusic_like&do=playmusic&articleId=' + encodeURIComponent(item.id), { headers: { 'User-Agent': YW_UA, 'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest', 'Referer': YW_BASE + '/yinyue/' + item.id + '.html' }, timeout: 9000, maxRedirects: 5, validateStatus: function () { return true; } });
+    var j = toObj(resp.data);
+    if (!Array.isArray(j) || !j[0] || (!j[0].url && !j[0].downlink)) throw new Error('音微：取链失败');
+    return { url: j[0].url || j[0].downlink, headers: { 'User-Agent': YW_UA } };
+  }
+
+  // ---- 通用备选源兜底封装：search → pickOrdered 身份校验 → url，命中即返回并打 X-Kg-Backup 溯源头 ----
+  async function tryBackup(name, searchFn, urlFn, musicItem) {
+    var q = (musicItem.title || '').trim() || (musicItem.artist || '').trim();
+    if (!q) throw new Error(name + '：歌曲标题为空，无法检索');
+    var items = await searchFn(q, musicItem);
+    var ordered = pickOrdered(items, musicItem);
+    if (!ordered || !ordered.length) throw new Error(name + '：无安全候选（身份校验拒绝错播）');
+    // 试播前 3 个候选（对齐 mv/aax 的多候选循环模式）：单候选空链/异常换下一个
+    var lastErr = '';
+    for (var i = 0; i < Math.min(ordered.length, 3); i++) {
+      try {
+        var res = await urlFn(ordered[i], musicItem);
+        if (res && res.url) {
+          if (!res.headers) res.headers = {};
+          res.headers['X-Kg-Backup'] = name;
+          return res;
+        }
+        lastErr = '空链接';
+      } catch (e) { lastErr = e.message; }
+    }
+    throw new Error(name + '：可取链候选均不可播放（' + (lastErr || '无可用链接') + '）');
+  }
+
+  // ============================ 组合取链 / 歌词（酷狗 → mvmp3 → gequbao → 11 备选 → aax 末位） ============================
   // 【v0.1.0 第三批】酷狗官方取链软熔断：官方 play/getdata 对大量歌曲返回空，空返回不进排序但徒增无谓请求；
   //   连续空返回/异常 5 次后熔断，跳过官方直走备用源；熔断状态可读（_internal.kgOfficialFuse）可重置（_internal.kgOfficialFuseReset）。
   var KG_OFFICIAL_FUSE_STREAK = 0;   // 连续空返回/异常计数
   var KG_OFFICIAL_FUSE_LIMIT = 5;    // 熔断阈值（可调）
   var KG_OFFICIAL_FUSED = false;     // 是否已熔断
   var KG_OFFICIAL_FUSE_AT = 0;       // 熔断时间戳
+  var KG_OFFICIAL_FUSE_RETRY_MS = 5 * 60 * 1000; // 熔断后半开试探间隔：满 5 分钟放行 1 次试探
 
   async function getMediaSource(musicItem, quality) {
     var errors = [];
 
-    // 1) 酷狗官方（软熔断：连续空返回 5 次后跳过，直走备用源）
-    if (KG_OFFICIAL_FUSED) {
+    // 1) 酷狗官方（软熔断：连续空返回 5 次后跳过，直走备用源；熔断满 5 分钟放行 1 次半开试探，成功清零复位/失败更新 FUSE_AT 继续熔断）
+    var kgHalfOpen = KG_OFFICIAL_FUSED && (Date.now() - KG_OFFICIAL_FUSE_AT) >= KG_OFFICIAL_FUSE_RETRY_MS;
+    if (KG_OFFICIAL_FUSED && !kgHalfOpen) {
       errors.push('酷狗官方:已软熔断(跳过)');
     } else {
       try {
         const kg = await kugouGetMediaSource(musicItem);
         if (kg && kg.url && /^https?:\/\//i.test(kg.url)) {
           KG_OFFICIAL_FUSE_STREAK = 0;   // 取得有效直链 → 复位连续空计数
+          if (KG_OFFICIAL_FUSED) { KG_OFFICIAL_FUSED = false; KG_OFFICIAL_FUSE_AT = 0; } // 半开试探成功 → 清零复位
           // 【v0.1.2】删除酷狗直链 HEAD 探测（v0.1.0 引入）：该探测成功/失败都返回同一 kg.url，对结果零收益；且每首首播同步阻塞≤4000ms（酷狗 CDN 对 HEAD 常慢/无响应）。直接返回直链，回归 v0.0.9 速度。
           return { url: kg.url, rawLrc: kg.rawLrc, artwork: kg.artwork, headers: { Referer: 'https://www.kugou.com/' } };
         } else {
+          if (KG_OFFICIAL_FUSED) KG_OFFICIAL_FUSE_AT = Date.now(); // 半开试探失败 → 更新 FUSE_AT 继续熔断
           KG_OFFICIAL_FUSE_STREAK++;
           if (KG_OFFICIAL_FUSE_STREAK >= KG_OFFICIAL_FUSE_LIMIT && !KG_OFFICIAL_FUSED) {
             KG_OFFICIAL_FUSED = true; KG_OFFICIAL_FUSE_AT = Date.now();
@@ -557,6 +869,7 @@
           }
         }
       } catch (e) {
+        if (KG_OFFICIAL_FUSED) KG_OFFICIAL_FUSE_AT = Date.now(); // 半开试探异常 → 更新 FUSE_AT 继续熔断
         KG_OFFICIAL_FUSE_STREAK++;
         if (KG_OFFICIAL_FUSE_STREAK >= KG_OFFICIAL_FUSE_LIMIT && !KG_OFFICIAL_FUSED) {
           KG_OFFICIAL_FUSED = true; KG_OFFICIAL_FUSE_AT = Date.now();
@@ -581,38 +894,63 @@
       if (ordered && ordered.length) {
         const url = await gbGetPlayUrl(ordered[0].id);
         if (url) return { url: url, rawLrc: '', artwork: musicItem.coverImg || musicItem.artwork || '' };
+      } else {
+        errors.push('歌曲宝:无安全候选'); // 空池不再静默跳过，记 error 便于总报错明细定位
       }
     } catch (e) { errors.push('歌曲宝:' + e.message); }
 
-    // 4) AAX音乐网 aax.cx（第③备用源，酷我系直链，作为 gequbao 之后的最后兜底）
+    // ④–⑬ 内联备选源：酷我系 → 网易系/聚合 → 独立站，顺序 tryBackup（身份校验拒绝错播）
+    try { var r4 = await tryBackup('gequhai', ghSearch, ghUrl, musicItem); if (r4 && r4.url) return r4; } catch (e) { errors.push('歌曲海:' + e.message); }
+    try { var r5 = await tryBackup('gequke', gkSearch, gkUrl, musicItem); if (r5 && r5.url) return r5; } catch (e) { errors.push('歌曲客:' + e.message); }
+    try { var r6 = await tryBackup('fengli', flSearch, flUrl, musicItem); if (r6 && r6.url) return r6; } catch (e) { errors.push('凤梨音乐:' + e.message); }
+    try { var r7 = await tryBackup('liusheng', lsSearch, lsUrl, musicItem); if (r7 && r7.url) return r7; } catch (e) { errors.push('溜声音乐:' + e.message); }
+    try { var r8 = await tryBackup('qeecc', qeSearch, qeUrl, musicItem); if (r8 && r8.url) return r8; } catch (e) { errors.push('无忧音乐网:' + e.message); }
+    try { var r9 = await tryBackup('gd', gdSearch, gdUrl, musicItem); if (r9 && r9.url) return r9; } catch (e) { errors.push('GD音乐台:' + e.message); }
+    try { var r10 = await tryBackup('myfree', mfSearch, mfUrl, musicItem); if (r10 && r10.url) return r10; } catch (e) { errors.push('MyFreeMP3:' + e.message); }
+    try { var r11 = await tryBackup('xiage', xgSearch, xgUrl, musicItem); if (r11 && r11.url) return r11; } catch (e) { errors.push('我要下歌:' + e.message); }
+    try { var r12 = await tryBackup('sq', sqSearch, sqUrl, musicItem); if (r12 && r12.url) return r12; } catch (e) { errors.push('音乐搜索神器:' + e.message); }
+    try { var r13a = await tryBackup('xiaomifeng', xmSearch, xmUrl, musicItem); if (r13a && r13a.url) return r13a; } catch (e) { errors.push('小蜜蜂音乐:' + e.message); }
+    try { var r13b = await tryBackup('yinwe', ywSearch, ywUrl, musicItem); if (r13b && r13b.url) return r13b; } catch (e) { errors.push('音微音乐:' + e.message); }
+
+    // ⑭ 极端末位：AAX音乐网 aax.cx（酷我系直链，本轮实测 0 结果，仅作最后兜底层；修复前跳过即不阻断）
     try {
       const src = await aaxGetMediaSource(musicItem);
       if (src && src.url) return src;
     } catch (e) { errors.push('AAX音乐网:' + e.message); }
 
     var songName = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
-    var msg = '酷狗、无名音乐网、歌曲宝、AAX音乐网四层均未能取得《' + songName + '》的音源。';
-    msg += '①酷狗官方接口已无免费直链（已软熔断跳过）；②无名音乐网取链失败（详见上）；③歌曲宝曲库未收录该版本（多为翻唱）；④AAX音乐网同样未收录。';
+    var msg = '酷狗官方、无名音乐网、歌曲宝及 11 个内联备选源均未能取得《' + songName + '》的音源。';
+    msg += '①酷狗官方接口已无免费直链（已软熔断跳过）；②无名音乐网取链失败（详见上）；③歌曲宝曲库未收录该版本（多为翻唱）；';
+    msg += '④~⑬ 酷我系/网易系/聚合/独立站备选源均身份校验拒绝或无可用直链；⑭AAX音乐网同样未收录。';
     msg += '若你确定该曲在无名音乐网有原唱，通常是其人机验证临时升级导致自动过验证失败，稍后重试即可。';
     msg += '。明细：' + errors.join('；');
     throw new Error(msg);
   }
 
   async function getLyric(musicItem) {
-    try { const kg = await kugouGetMediaSource(musicItem); if (kg && kg.rawLrc) return { rawLrc: kg.rawLrc }; } catch (e) {}
+    // 官方歌词层随软熔断跳过（熔断时直接走备用歌词），避免绕过熔断打官方接口
+    if (!KG_OFFICIAL_FUSED) { try { const kg = await kugouGetMediaSource(musicItem); if (kg && kg.rawLrc) return { rawLrc: kg.rawLrc }; } catch (e) {} }
     try { const l = await mvGetLyric(musicItem); if (l && l.rawLrc) return l; } catch (e) {}
     try {
       const q = (musicItem.title || '').trim();
       const g = await gbSearch(q);
-      const ordered = pickOrdered(g, musicItem);
+      const ordered = pickOrderedForLyric(g, musicItem);
       if (ordered && ordered.length) {
-        const l = await gbGetLyric(ordered[0].id);
-        if (l && l.rawLrc) return l;
+        // 逐候选取页内歌词（2026-11-16）：仅试 ordered[0] 时单候选页缺歌词即整层落空，扩为前 3 候选
+        for (var gi = 0; gi < Math.min(ordered.length, 3); gi++) {
+          const l = await gbGetLyric(ordered[gi].id);
+          if (l && l.rawLrc) return l;
+        }
+      } else if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[kg 歌词] 歌曲宝:无安全候选'); // 空池记 error（同 getMediaSource errors.push，此处无 errors 通道改用 warn）
       }
     } catch (e) {}
     try {
       const l = await aaxGetLyric(musicItem); if (l && l.rawLrc) return l;
     } catch (e) {}
+    // 网易系/聚合 歌词兜底（自带 lrc，含身份校验）
+    try { const ml = await mfGetLyric(musicItem); if (ml && ml.rawLrc) return ml; } catch (e) {}
+    try { const sl = await sqGetLyric(musicItem); if (sl && sl.rawLrc) return sl; } catch (e) {}
     return { rawLrc: '' };
   }
 
@@ -915,17 +1253,18 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '酷狗',
-    version: '0.1.2',
+    version: '0.1.14',
     author: 'tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)',
-    description: '酷狗官方 + 无名音乐网(mvmp3，自动过人机验证) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 四层兜底取链；' +
+    description: '酷狗官方 + 无名音乐网(mvmp3，自动过人机验证) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 等，官方+14 备用源顺序兜底（共 15 层）取链；' +
       'v0.1.0：下沉 qq.js v0.1.8 三态身份校验修复「同名异版错播」、新增第③备用源 AAX音乐网(三层→四层)、' +
       '酷狗官方取链软熔断(连续空返回5次跳过)、取链质量打分(matchScore择优)；' +
       'v0.1.2：删除酷狗直链 HEAD 探测（v0.1.0 引入的≤4000ms 首播阻塞、零收益），取得直链直接返回，回归 v0.0.9 速度；' +
       '支持酷狗歌单导入、官方排行榜（按热歌/地区/特色/全球/曲风分层）与热门榜单；' +
       '热门歌单广场（分类标签浏览酷狗歌单）。' +
       'v0.0.9 修复：歌单详情/导入取歌改用 mobilecdn special/song JSON 接口，解决点进歌单歌曲空白。' +
+      'v0.1.14 修复：歌词链引入宽松选池（严格池拒绝错播为空时按歌名匹配兜底，同歌手优先），解决「部分歌单可播放但不显示歌词」；歌曲宝歌词扩为前 3 候选。' +
       '⚠️ 仅供个人学习与研究使用。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.2/musicfree-kg/kg.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.14/musicfree-kg/github/kg.js',
     cacheControl: 'no-store',
     supportedSearchType: ['music'],
     primaryKey: ['id', 'album_id', 'album_audio_id'],
@@ -947,7 +1286,7 @@
     ],
     hints: {
       getMediaSource: [
-        '取链顺序：酷狗官方 → 无名音乐网(mvmp3) → 歌曲宝(gequbao) → AAX音乐网(aax.cx) 四层兜底，任一层成功即用。',
+        '取链顺序：酷狗官方 → 无名音乐网(mvmp3) → 歌曲宝(gequbao) → … → AAX音乐网(aax.cx) 末位，官方+14 备用源顺序兜底（共 15 层），任一层成功即用。',
         '无名音乐网(mvmp3)与 AAX音乐网(aax.cx)的人机验证由插件自动完成，无需你手动操作；会话约 50 分钟自动刷新一次。',
         '酷狗官方接口对大量歌曲已无免费直链，连续 5 次空返回会自动软熔断并跳过官方，直走备用源（重启或 _internal.kgOfficialFuseReset() 可重置）。',
       ],
@@ -1000,6 +1339,21 @@
       kgOfficialFuseReset: function () { KG_OFFICIAL_FUSED = false; KG_OFFICIAL_FUSE_STREAK = 0; KG_OFFICIAL_FUSE_AT = 0; },
       // 第二批：AAX音乐网会话预热 / 状态
       aaxEnsureCookie: function () { return ensureAaxCookie(); },
+      // 第三批：11 个内联备选源 search/url + 通用兜底封装（诊断接口，对齐 wy/kw）
+      tryBackup: tryBackup,
+      backups: {
+        gequhai: { search: ghSearch, url: ghUrl },
+        gequke: { search: gkSearch, url: gkUrl },
+        fengli: { search: flSearch, url: flUrl },
+        liusheng: { search: lsSearch, url: lsUrl },
+        qeecc: { search: qeSearch, url: qeUrl },
+        gd: { search: gdSearch, url: gdUrl },
+        myfree: { search: mfSearch, url: mfUrl },
+        xiage: { search: xgSearch, url: xgUrl },
+        sq: { search: sqSearch, url: sqUrl },
+        xiaomifeng: { search: xmSearch, url: xmUrl },
+        yinwe: { search: ywSearch, url: ywUrl },
+      },
     },
   };
 
