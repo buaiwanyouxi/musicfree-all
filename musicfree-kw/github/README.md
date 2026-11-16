@@ -1,6 +1,6 @@
 # 酷我音源插件（kw.js）使用说明
 
-> 当前版本：v0.0.4 ｜ 作者：tianpeng
+> 当前版本：v0.0.5 ｜ 作者：tianpeng
 
 > **平台**：酷我 ｜ **版本**：v0.0.2 ｜ **作者**：tianpeng
 > **适配**：[MusicFree](https://github.com/maotoumao/MusicFree) 桌面端 / 移动端
