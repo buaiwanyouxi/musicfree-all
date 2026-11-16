@@ -838,6 +838,8 @@
       try {
         var res = await urlFn(ordered[i], musicItem);
         if (res && res.url) {
+          // 【2026-11-16】试听/铃声短片段闸门：片段换下一候选，不再把 12s 无效音频交给播放器
+          if (await urlIsPreview(res.url, musicItem && musicItem.duration)) { lastErr = '试听/铃声短片段，已拒绝'; continue; }
           if (!res.headers) res.headers = {};
           res.headers['X-Wy-Backup'] = name;
           return res;
@@ -861,6 +863,34 @@
     _bkFail[name] = (_bkFail[name] || 0) + 1;
     if (_bkFail[name] >= BK_FAIL_LIMIT) { _bkCooldown[name] = Date.now() + BK_COOLDOWN_MS; _bkFail[name] = 0; }
   }
+  // ---- 试听/铃声短片段闸门（2026-11-16 对齐 qq.js/xiage.js；官方链已有 headLen 试听检测，此闸门守备用链）----
+  // 背景：酷我系聚合站（凤梨/溜声等）对部分条目回吐铃声/试听片段（实测「Letting Go」75KB≈12s，
+  //   car-bj.kuwo.cn/…/lx/resource/*.aac），原逻辑只看有无 url 即放行 → 用户听到 12s 无效音频。
+  // 判定：Range GET(bytes=0-0) 读资产总字节（content-range 总量优先、200 的 content-length 兜底），
+  //   期望时长已知 → 低于「16kbps 半量线」（秒数×2000 字节）判短片段；未知 → 退 1.2MB 绝对阈值（xiage.js 同口径）。
+  function isPreviewBytes(total, expectMs) {
+    if (!total || total < 8192) return false;            // 无法判定（含 206 仅回 range 长度）→ 不误杀
+    if (expectMs > 0) return total < (expectMs / 1000) * 2000;
+    return total < 1.2 * 1024 * 1024;
+  }
+  async function urlIsPreview(url, expectMs) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': UA, Referer: 'https://music.163.com/', Range: 'bytes=0-0' },
+        timeout: 4000, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var total = 0;
+      if (r.status >= 200 && r.status < 300) {
+        var cr = (r.headers && r.headers['content-range']) || '';
+        var mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        if (mc) total = parseInt(mc[1], 10);
+        else if (r.status === 200 && r.headers && r.headers['content-length']) total = parseInt(r.headers['content-length'], 10) || 0; // 206 的 content-length 仅 range 长度
+      }
+      return isPreviewBytes(total, expectMs);
+    } catch (e) { return false; } // 探测异常不误杀
+  }
+
   // 包装单个备选源：预算/冷却守门 → 调用 → 记熔断状态并汇总 errs；命中返回 res，否则 null
   async function bkTry(name, fn, errs, deadline) {
     if (Date.now() >= deadline) { errs.push(name + ':全局预算耗尽跳过'); return null; }
@@ -930,6 +960,8 @@
     // ① 首选：无名音乐网 mvmp3（自动过人机验证）
     var mv = await bkTry('mvmp3', async function () {
       var m = await mvGetMediaSource(musicItem);
+      // 【2026-11-16】试听/铃声短片段闸门
+      if (m && m.url && (await urlIsPreview(m.url, musicItem && musicItem.duration))) throw new Error('试听/铃声短片段，已拒绝');
       return (m && m.url) ? { url: m.url } : null; // 不带 Referer（否则 CDN 403）
     }, errs, deadline);
     if (mv) return mv;
@@ -941,8 +973,13 @@
       if (g && g.length) {
         var ordered = pickOrdered(g, musicItem);
         if (!ordered) throw new Error('歌曲宝候选均未通过身份校验（歌名或歌手不符），已拒绝错播');
-        var gurl = await gbGetPlayUrl(ordered[0].id);
-        if (gurl && gurl.url) return { url: gurl.url, artwork: musicItem.coverImg || musicItem.artwork || '' };
+        for (var gbi = 0; gbi < Math.min(ordered.length, 3); gbi++) {
+          var gurl = await gbGetPlayUrl(ordered[gbi].id);
+          // 【2026-11-16】试听/铃声短片段闸门：片段换下一候选
+          if (gurl && gurl.url && !(await urlIsPreview(gurl.url, musicItem && musicItem.duration))) {
+            return { url: gurl.url, artwork: musicItem.coverImg || musicItem.artwork || '' };
+          }
+        }
       }
       return null;
     }, errs, deadline);
@@ -975,6 +1012,8 @@
     // ⑬ 极端末位：布谷音乐 buguyy.top（酷我镜像，前 12 层均失效时的最后兜底）
     var bg = await bkTry('布谷音乐', async function () {
       var b = await bgGetMediaSource(musicItem);
+      // 【2026-11-16】试听/铃声短片段闸门
+      if (b && b.url && (await urlIsPreview(b.url, musicItem && musicItem.duration))) throw new Error('试听/铃声短片段，已拒绝');
       return (b && b.url) ? { url: b.url } : null; // 不带 Referer（酷我 CDN 会 403）
     }, errs, deadline);
     if (bg) return bg;
@@ -1134,7 +1173,7 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '网易云音乐',
-    version: '0.1.14',
+    version: '0.1.15',
     author: 'tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)',
     description: '网易云音乐音源：支持歌单导入（含大歌单全量+分页缓存）、热门歌单、官方排行榜，附带搜索/歌词/取链。' +
       '全部走免加密官方 /api 接口；VIP/付费曲目免费态仅返回约 30 秒试听片段（版权限制）。' +
@@ -1144,7 +1183,7 @@
       'v0.1.1 第五批：官方 /api 偶发 460/429/5xx 失败指数退避重试（1s→2s→4s），其余错误立即抛出不重试。' +
       'v0.1.3：修复「推荐歌单/精品歌单只能获取前 10 首」——/playlist/detail 显式传 limit(1000)，使 tracks 直接回全量曲目，' +
       '不再因接口默认仅回前 ~10 首且 trackIds 缺失而被静默截断；大歌单(>1000)仍走 trackIds 分批 /song/detail 兜底。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.14/musicfree-wy/github/wy.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.15/musicfree-wy/github/wy.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music', 'sheet'],
     userVariables: [
@@ -1173,6 +1212,9 @@
     },
     // ============================ v0.1.1 内部诊断接口（仅供测试 / 运维，不影响取链） ============================
     _internal: {
+      // 【2026-11-16】试听/铃声短片段闸门（供单测）
+      isPreviewBytes: isPreviewBytes,
+      urlIsPreview: urlIsPreview,
       // 第一批：三态身份校验 / 统一选池 / 取链打分
       norm: norm,
       titleOk: titleOk,
