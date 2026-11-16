@@ -1,5 +1,5 @@
 // 汽水音乐（字节系 Qishui / Luna）音源插件
-// 平台：汽水音乐  author：tianpeng  version：0.0.1
+// 平台：汽水音乐  author：tianpeng  version：0.0.6
 //
 // 接口契约（经运行时联网实测参考插件「开心汽水.js」+ 真实请求验证得出）：
 //   搜索        GET  api-vehicle.volcengine.com/v2/search/type
@@ -7,9 +7,8 @@
 //   取链(两步)  GET  beta-luna.douyin.com/luna/h5/seo_track  ->  track_player.url_player_info(GetPlayInfo) / video_model.main_url
 //   排行榜详情  GET  api5-lf.qishui.com/luna/charts/<id>?charge=0
 //   歌单详情    POST api5-lf.qishui.com/luna/playlist/detail?charge=0   (body: playlist_id)  —— 注意：用开放子域 lf，参考插件用的 lq 被墙返回空
-//   热门歌单    POST api5-lq.qishui.com/luna/discover/mix?charge=0       —— 该接口需汽水 App 原生签名(X-Gorgon/X-Argus)，plain 客户端返回空，属已知限制
-// 说明：汽水音乐为字节私有加密 API（社区公认难度最高）。搜索/取链/歌词/排行榜/歌单导入均可免签调用；
-//      仅「按标签取热门歌单」依赖原生签名，无签 plain 客户端无法返回数据（插件不崩溃、返回空列表）。
+//   热门歌单    POST api5-lq.qishui.com/luna/discover/mix?charge=0       —— v0.0.6 起用网页 UA 无签名头可免签返回 inner_block 卡片流（伪造 X-Argus/App UA 会被静默清空）
+// 说明：汽水音乐为字节私有加密 API（社区公认难度最高）。搜索/取链/歌词/排行榜/歌单导入/热门歌单均可免签调用。
 (function () {
   var reqFn = (typeof __musicfree_require !== 'undefined') ? __musicfree_require : require;
   var axios = reqFn('axios');
@@ -24,6 +23,13 @@
 
   var CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36';
   var QISHUI_UA = 'com.luna.music/100159040 (Linux; U; Android 11; zh_CN; Cronet/TTNetVersion:dd1b0931 2024-06-28 QuicVersion:d299248d 2024-04-09)';
+
+  // ---------- 超时/分页/换算 常量（魔数常量化） ----------
+  var QS_TIMEOUT = 10000;       // 通用接口超时
+  var QS_TRACK_TIMEOUT = 5000;  // 取链两步（seo_track / GetPlayInfo）收紧为 5s
+  var QS_SEARCH_SIZE = 20;      // 搜索页大小
+  var QS_PAGE_SIZE = 30;        // 排行榜/歌单详情分页大小
+  var SEC_TO_MS = 1000;         // 秒 -> 毫秒换算
 
   // ---------- 工具 ----------
   function toObj(d) {
@@ -42,6 +48,17 @@
       'User-Agent': QISHUI_UA,
       'X-Argus': '=',
       'x-common-params-v2': 'channel=appstore&aid=8478&device_id=1100210274091033',
+    };
+    var ck = getCookie();
+    if (ck) h['Cookie'] = ck;
+    return h;
+  }
+  // discover/mix 专用头（2026-11-16）：网页 UA、【不带】伪造 X-Argus/App 公共参数——实测伪造签名头会让接口静默返回空 {}
+  function discoverHeaders() {
+    var h = {
+      'Accept': '*/*',
+      'Content-Type': 'application/json',
+      'User-Agent': CHROME_UA,
     };
     var ck = getCookie();
     if (ck) h['Cookie'] = ck;
@@ -67,6 +84,11 @@
   // 统一字段映射（覆盖 charts / playlist / search 多种形态）
   function formatTrack(it) {
     if (!it) return null;
+    // 歌单详情 media_resources 形态：{id,type,entity:{track_wrapper:{track:{...}}}}（2026-11-16 修复）：
+    //   真实曲目嵌在 entity.track_wrapper.track 内层（字段 name/artists/duration/album），原实现直读外层
+    //   导致歌单曲目全空（「歌单里也没有歌曲」）。先解嵌套再映射；兼容 entity.track 直挂形态。
+    if (it.entity && it.entity.track_wrapper && it.entity.track_wrapper.track) it = it.entity.track_wrapper.track;
+    else if (it.entity && it.entity.track) it = it.entity.track;
     var artists = it.artists || it.artist_list || [];
     var artist = it.artist;
     if (!artist && artists.length) artist = artists.map(function (a) { return a.name || a; }).join('/');
@@ -74,7 +96,7 @@
     var album = it.album || (it.album_info && it.album_info.name) || '';
     var artwork = artworkFromCover(it.artwork || it.album || it.cover_url || it.pic_url);
     var dur = it.duration;
-    if (dur && dur < 1000) dur = dur * 1000; // 秒->毫秒
+    if (dur && dur < SEC_TO_MS) dur = dur * SEC_TO_MS; // 秒->毫秒
     return {
       id: String(it.id || it.track_id || it.item_id),
       title: it.title || it.name || it.song_name || '',
@@ -100,10 +122,10 @@
     if (type && type !== 'music') return { isEnd: true, data: [] };
     var r = await axios.get(SEARCH_API, {
       params: {
-        keyword: query, search_type: 'music', limit: 20,
-        real_offset: (Math.max(1, page || 1) - 1) * 20, search_source: 'qishui',
+        keyword: query, search_type: 'music', limit: QS_SEARCH_SIZE,
+        real_offset: (Math.max(1, page || 1) - 1) * QS_SEARCH_SIZE, search_source: 'qishui',
       },
-      timeout: 10000, validateStatus: function () { return true; },
+      timeout: QS_TIMEOUT, validateStatus: function () { return true; },
     });
     var d = toObj(r.data);
     var list = (d.data && d.data.list) || [];
@@ -113,40 +135,121 @@
         title: it.title || '',
         artist: (it.author_info && it.author_info.name) || '',
         artwork: it.cover_url || '',
-        duration: it.duration ? it.duration * 1000 : undefined,
+        duration: it.duration ? it.duration * SEC_TO_MS : undefined,
       };
     });
-    return { isEnd: list.length < 20, data: data };
+    return { isEnd: list.length < QS_SEARCH_SIZE, data: data };
   }
 
   // ---------- 取链（两步：seo_track -> GetPlayInfo / video_model） ----------
-  async function getMediaSource(musicItem, quality) {
-    var tid = String(musicItem.id);
+  async function seoTrack(trackId) {
     var r = await axios.get(SEO_TRACK, {
-      params: { track_id: tid, device_platform: 'web' },
-      headers: {}, timeout: 10000, validateStatus: function () { return true; },
+      params: { track_id: trackId, device_platform: 'web' },
+      headers: {}, timeout: QS_TRACK_TIMEOUT, validateStatus: function () { return true; },
     });
-    var d = toObj(r.data);
-    var tp = d.track_player;
-    if (!tp) throw new Error('无法获取播放信息（汽水返回异常）');
-    var url = null;
+    return toObj(r.data);
+  }
+  // 从 track_player 解析「可播 URL + 资产时长（秒）」。
+  // 时长权威字段：video_model.video_duration（GetPlayInfo Result.Data.Duration 与之实测一致，如 29.002 / 279.918）。
+  // URL 两路径：① url_player_info 的 GetPlayInfo（Result.Data.PlayInfoList[].MainPlayUrl，或平铺 gd.url/gd.video_list）；
+  //            ② video_model.video_list[0].main_url。实测 GetPlayInfo 用 MainPlayUrl 字段（原 gd.url 解析不到，靠②兜底）。
+  async function pickPlayable(tp) {
+    var url = null, durSec = 0;
+    var vm = tp.video_model;
+    if (typeof vm === 'string') { try { vm = JSON.parse(vm); } catch (e) { vm = null; } }
+    if (vm && vm.video_duration) durSec = +vm.video_duration || 0;
     if (tp.url_player_info) {
       try {
-        var g = await axios.get(tp.url_player_info, { timeout: 10000, validateStatus: function () { return true; } });
+        var g = await axios.get(tp.url_player_info, { timeout: QS_TRACK_TIMEOUT, validateStatus: function () { return true; } });
         var gd = toObj(g.data);
         url = gd.url || (gd.video_list && gd.video_list[0] && (gd.video_list[0].main_url || gd.video_list[0].backup_url));
+        if (gd.Result && gd.Result.Data) {
+          var D = gd.Result.Data;
+          if (!durSec && D.Duration) durSec = +D.Duration || 0;
+          if (!url && D.PlayInfoList && D.PlayInfoList[0]) url = D.PlayInfoList[0].MainPlayUrl || D.PlayInfoList[0].BackupPlayUrl || null;
+        }
       } catch (e) { /* 忽略，尝试下一条路径 */ }
     }
-    if (!url && tp.video_model) {
-      try {
-        var vm = (typeof tp.video_model === 'string') ? JSON.parse(tp.video_model) : tp.video_model;
-        var vl = (vm && vm.video_list) || [];
-        if (vl[0]) url = vl[0].main_url || vl[0].backup_url;
-      } catch (e) { /* ignore */ }
+    if (!url && vm) {
+      var vl = vm.video_list || [];
+      if (vl[0]) url = vl[0].main_url || vl[0].backup_url;
     }
-    if (!url) throw new Error('无法获取播放链接：该汽水歌曲可能已下架或需登录');
+    return { url: url, durSec: durSec };
+  }
+  // 短片段判定：期望时长已知（musicItem.duration 毫秒）且资产不足期望的一半
+  function isClip(durSec, expectMs) {
+    return !!(expectMs > 0 && durSec > 0 && durSec * SEC_TO_MS < expectMs * 0.5);
+  }
+  async function getMediaSource(musicItem, quality) {
+    var d, tp;
+    try {
+      d = await seoTrack(String(musicItem.id));
+      tp = d.track_player;
+      if (!tp) throw new Error('无法获取播放信息（汽水返回异常）');
+    } catch (e) {
+      // 取链零兜底（仅 1 次重试）：seo_track 抛错或 track_player 缺失时，按 musicItem.title 调自身 search
+      // 取第一个结果的 id 重试 seo_track；重试仍失败则照常抛错。
+      var s = await search(musicItem.title || '', 1, 'music');
+      var first = s && s.data && s.data[0];
+      if (!first || !first.id) throw e;
+      d = await seoTrack(String(first.id));
+      tp = d.track_player;
+      if (!tp) throw new Error('无法获取播放信息（汽水返回异常）');
+    }
+    var pk = await pickPlayable(tp);
+    if (!pk.url) throw new Error('无法获取播放链接：该汽水歌曲可能已下架或需登录');
+
+    // 修复（2026-11-16）：汽水曲库部分条目资产仅为 20–60s 短视频片段——
+    //   实测「孤勇者-陈奕迅」搜索元数据 256s，但 video_model.video_duration=29.002s（GetPlayInfo 同 29s），
+    //   播放约 1 分钟即停。现对「资产时长 < 期望时长一半」自动换完整版：
+    //   按标题重搜，候选排序（同歌手优先 → 元数据时长接近期望优先），逐个取链校验资产时长
+    //   （容差 max(15s, 期望20%)，且不得仍是短片段），命中即换用，最多验证 3 个候选。
+    //   全部候选仍为片段（曲库仅有片段授权）时保留原链路并告警，宁可短片段也不拒播。
+    var expectMs = musicItem && musicItem.duration;
+    if (isClip(pk.durSec, expectMs)) {
+      var expectSec = expectMs / SEC_TO_MS;
+      var myId = String(musicItem.id);
+      var myArtist = (musicItem.artist || '').trim();
+      try {
+        var s2 = await search(musicItem.title || '', 1, 'music');
+        var cands = (s2 && s2.data) || [];
+        var scored = [];
+        for (var i = 0; i < cands.length; i++) {
+          var c = cands[i];
+          if (!c || !c.id || c.id === myId) continue;               // 排除已证实为片段的原条目
+          var md = (c.duration || 0) / SEC_TO_MS;
+          if (md > 0 && md < expectSec * 0.5) continue;             // 元数据即短的候选跳过
+          var sameArtist = myArtist && (c.artist || '').trim() === myArtist;
+          var diff = md > 0 ? Math.abs(md - expectSec) : 1e9;
+          scored.push({ c: c, diff: diff, artistRank: sameArtist ? 0 : 1 });
+        }
+        scored.sort(function (a, b) {
+          if (a.artistRank !== b.artistRank) return a.artistRank - b.artistRank;
+          return a.diff - b.diff;
+        });
+        var tried = 0;
+        for (var j = 0; j < scored.length && tried < 3; j++) {
+          var cand = scored[j].c;
+          tried++;
+          try {
+            var d2 = await seoTrack(String(cand.id));
+            var tp2 = d2 && d2.track_player;
+            if (!tp2) continue;
+            var pk2 = await pickPlayable(tp2);
+            if (!pk2.url || isClip(pk2.durSec, expectMs)) continue;                    // 仍是片段
+            if (pk2.durSec > 0 && Math.abs(pk2.durSec - expectSec) > Math.max(15, expectSec * 0.2)) continue; // 时长仍不符
+            console.warn('[qs] 短片段换完整版: ' + musicItem.title + ' id ' + myId + ' 资产 ' + pk.durSec + 's -> id ' + cand.id + ' 资产 ' + pk2.durSec + 's (' + (cand.artist || '?') + ')');
+            pk = pk2;
+            break;
+          } catch (e2) { /* 单候选失败继续下一个 */ }
+        }
+      } catch (e3) { /* 重搜失败保留原链路 */ }
+      if (isClip(pk.durSec, expectMs)) {
+        console.warn('[qs] ' + (musicItem.title || myId) + ' 在汽水仅有短片段资产(' + pk.durSec + 's)，换源后仍无完整版（曲库限制）');
+      }
+    }
     return {
-      url: url,
+      url: pk.url,
       headers: { 'Referer': 'https://www.douyin.com/', 'User-Agent': CHROME_UA, 'Accept': '*/*' },
     };
   }
@@ -155,7 +258,7 @@
   async function getContentItem(id) {
     var r = await axios.get(CONTENT_API, {
       params: { sources: 'qishui', need_author: true, need_album: true, need_ugc: true, need_stat: true, item_ids: String(id) },
-      timeout: 10000, validateStatus: function () { return true; },
+      timeout: QS_TIMEOUT, validateStatus: function () { return true; },
     });
     var d = toObj(r.data);
     return (d.data && d.data.list && d.data.list[0]) || {};
@@ -189,12 +292,15 @@
   }
   async function getTopListDetail(topListItem, page) {
     var r = await axios.get(CHARTS_API + topListItem.id + '?charge=0', {
-      headers: qHeaders(), timeout: 10000, validateStatus: function () { return true; },
+      headers: qHeaders(), timeout: QS_TIMEOUT, validateStatus: function () { return true; },
     });
     var d = toObj(r.data);
     var ranks = (d.chart && d.chart.track_ranks) || [];
-    var musicList = ranks.map(function (x) { return formatTrack(x.track); }).filter(Boolean);
-    return { isEnd: true, musicList: musicList };
+    var all = ranks.map(function (x) { return formatTrack(x.track); }).filter(Boolean);
+    // 按 page 分页（每页 QS_PAGE_SIZE；MusicFree 页码从 1 开始，即 0-based 的 (page+1)*30 >= total 口径）
+    var cur = Math.max(1, page || 1);
+    var musicList = all.slice((cur - 1) * QS_PAGE_SIZE, cur * QS_PAGE_SIZE);
+    return { isEnd: cur * QS_PAGE_SIZE >= all.length, musicList: musicList };
   }
 
   // ---------- 热门歌单（标签 + 按标签） ----------
@@ -209,28 +315,44 @@
     return { data: [], pinned: pinned };
   }
   async function getRecommendSheetsByTag(tag, page) {
-    // 注意：discover/mix 需汽水 App 原生签名，plain 客户端通常返回空（已知限制，不崩溃）
+    // 修复（2026-11-16）：原实现两坑叠加导致热门歌单恒空白：
+    //   ① 用 qHeaders（含伪造 X-Argus:'=' + App UA）请求 discover/mix，接口静默返回空 {}（实测裸 Chrome UA
+    //      无 X-Argus 才返回卡片流；qishui App UA 无合法签名同样被清空）；
+    //   ② 解析按 d.data/mix_list/playlists 找列表，实际形态是 inner_block:[{type:'discover_playlist',
+    //      resources:[{type:'playlist', entity:{playlist:{...}}}]}]（entity.playlist 内层才是歌单元数据）。
+    //   现改网页 UA 无签名头请求 + 按 inner_block/entity.playlist 解析；cursor 分页（每页约 10 卡片）。
+    var cur = Math.max(1, page || 1);
     try {
       var r = await axios.post(DISCOVER_API, {
         block_type: 'discover_playlist_mix', feed_discover_extra: {},
         latest_douyin_liked_playlist_show_ts: 0,
         sub_channel_id: tag && tag.id,
-      }, { headers: qHeaders(), timeout: 10000, validateStatus: function () { return true; } });
+        cursor: (cur - 1) * 10,
+      }, { headers: discoverHeaders(), timeout: QS_TIMEOUT, validateStatus: function () { return true; } });
       var d = toObj(r.data);
-      var arr = d.data || d.mix_list || d.playlists || [];
-      if (arr && arr.data) arr = arr.data;
-      var data = (arr || []).map(function (it) {
-        return {
-          id: String(it.id || it.playlist_id),
-          title: it.title || it.name || '',
-          artist: it.creator || (it.creator_info && it.creator_info.name) || '',
-          artwork: it.cover_url || it.pic_url || it.coverImg || '',
-          playCount: it.play_count || it.stat && it.stat.play_count,
-          createUserId: it.creator_id || it.user_id,
-        };
+      var blocks = d.inner_block || d.data || d.mix_list || d.playlists || [];
+      if (blocks && blocks.data) blocks = blocks.data;
+      var data = [];
+      (blocks || []).forEach(function (b) {
+        var resArr = (b && b.resources) || [];
+        if (!resArr.length && b && b.entity) resArr = [b];
+        resArr.forEach(function (rr) {
+          var pl = (rr && rr.entity && rr.entity.playlist) || (b && b.playlist) || null;
+          if (!pl) return;
+          data.push({
+            id: String(pl.id || (b && b.inner_block_id) || ''),
+            title: pl.title || (b && b.title) || '',
+            artist: (pl.owner && pl.owner.nickname) || '',
+            artwork: artworkFromCover(pl.url_cover || pl.cover_url),
+            description: pl.desc,
+            playCount: pl.play_count || (pl.stats && pl.stats.play_count),
+            createUserId: pl.owner && pl.owner.id,
+          });
+        });
       });
       return { isEnd: !d.has_more, data: data };
     } catch (e) {
+      console.warn('[qs] discover/mix 失败: ' + (e && e.message));
       return { isEnd: true, data: [] };
     }
   }
@@ -238,7 +360,7 @@
   // ---------- 歌单导入 ----------
   async function getPlaylistRaw(pid) {
     var r = await axios.post(PLAYLIST_API, { playlist_id: pid }, {
-      headers: qHeaders(), timeout: 10000, validateStatus: function () { return true; },
+      headers: qHeaders(), timeout: QS_TIMEOUT, validateStatus: function () { return true; },
     });
     var d = toObj(r.data);
     if (d.status_code) {
@@ -246,13 +368,16 @@
     }
     return d;
   }
+  // 歌单曲目提取（importMusicSheet / getMusicSheetInfo 共用，去重四元表达式）
+  function extractTracks(d) {
+    var meta = d.playlist || d;
+    return d.media_resources || d.track_list || d.musics || (meta && meta.media_resources) || [];
+  }
   async function importMusicSheet(urlLike) {
     var pid = parsePlaylistId(urlLike);
     if (!pid) throw new Error('无法识别的汽水歌单链接，请粘贴汽水APP分享链接或纯数字歌单ID');
     var d = await getPlaylistRaw(pid);
-    var meta = d.playlist || d;
-    var tracks = d.media_resources || d.track_list || d.musics || (meta && meta.media_resources) || [];
-    var list = tracks.map(formatTrack).filter(Boolean);
+    var list = extractTracks(d).map(formatTrack).filter(Boolean);
     if (!list.length) throw new Error('该汽水歌单暂无歌曲或需登录后才能访问');
     return list;
   }
@@ -260,11 +385,13 @@
     var pid = parsePlaylistId(sheetItem.id) || sheetItem.id;
     var d = await getPlaylistRaw(pid);
     var meta = d.playlist || d;
-    var tracks = d.media_resources || d.track_list || d.musics || (meta && meta.media_resources) || [];
-    var musicList = tracks.map(formatTrack).filter(Boolean);
+    var musicList = extractTracks(d).map(formatTrack).filter(Boolean);
+    // 按 page 分页（每页 QS_PAGE_SIZE；MusicFree 页码从 1 开始）；importMusicSheet 仍全量拉取不受影响
+    var cur = Math.max(1, page || 1);
+    var pageList = musicList.slice((cur - 1) * QS_PAGE_SIZE, cur * QS_PAGE_SIZE);
     return {
-      isEnd: true,
-      musicList: musicList,
+      isEnd: cur * QS_PAGE_SIZE >= musicList.length,
+      musicList: pageList,
       sheetItem: {
         id: String(pid),
         title: meta.title || meta.name || sheetItem.title,
@@ -274,15 +401,16 @@
     };
   }
 
-  module.exports = {
+  var plugin = {
     platform: '汽水音乐',
-    version: '0.0.1',
+    version: '0.0.6',
     author: 'tianpeng',
-    description: '汽水音乐（字节 Luna）音源：搜索/取链/歌词/排行榜/歌单导入。' +
-      '搜索、取链、歌词、排行榜、歌单导入均可免签调用；按标签热门歌单依赖汽水原生签名，plain 客户端可能返回空（可在 userVariables 填汽水会话 Cookie 尝试解锁）。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfreemusicfree-all@main/musicfree-qs/qs.js',
+    description: '汽水音乐（字节 Luna）音源：搜索/取链/歌词/排行榜/歌单/热门歌单。' +
+      '搜索、取链、歌词、排行榜、歌单导入、按标签热门歌单均可免签调用（v0.0.6 修复热门歌单空白与歌单曲目为空）。',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.0.6/musicfree-qs/github/qs.js',
     cacheControl: 'no-cache',
     supportedSearchType: ['music'],
+    primaryKey: ['id'],
     userVariables: [
       {
         key: 'cookie',
@@ -291,6 +419,9 @@
       },
     ],
     hints: {
+      getMediaSource: [
+        '当前单音质输出（quality 参数暂未分档）',
+      ],
       importMusicSheet: [
         '汽水APP：歌单-分享-分享链接；手动访问链接后再复制链接粘贴即可',
         '网页：复制URL并粘贴，或者直接输入纯数字歌单ID即可',
@@ -307,5 +438,14 @@
     getRecommendSheetsByTag: getRecommendSheetsByTag,
     importMusicSheet: importMusicSheet,
     getMusicSheetInfo: getMusicSheetInfo,
+    // 诊断用内部接口（不影响取链）
+    _internal: {
+      formatTrack: formatTrack,
+      parsePlaylistId: parsePlaylistId,
+    },
   };
+
+  if (typeof module !== 'undefined' && module && module.exports) module.exports = plugin;
+  if (typeof exports !== 'undefined') exports.default = plugin;
+  return plugin;
 })();
