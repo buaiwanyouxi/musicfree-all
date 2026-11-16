@@ -813,6 +813,34 @@
     return { url: j[0].url || j[0].downlink, headers: { 'User-Agent': YW_UA } };
   }
 
+  // ---- 试听/铃声短片段闸门（2026-11-16 对齐 qq.js/xiage.js）----
+  // 背景：酷我系聚合站（凤梨/溜声等）对部分条目回吐铃声/试听片段（实测「Letting Go」75KB≈12s，
+  //   car-bj.kuwo.cn/…/lx/resource/*.aac），原逻辑只看有无 url 即放行 → 用户听到 12s 无效音频。
+  // 判定：Range GET(bytes=0-0) 读资产总字节（content-range 总量优先、200 的 content-length 兜底），
+  //   期望时长已知 → 低于「16kbps 半量线」（秒数×2000 字节）判短片段；未知 → 退 1.2MB 绝对阈值（xiage.js 同口径）。
+  function isPreviewBytes(total, expectMs) {
+    if (!total || total < 8192) return false;            // 无法判定（含 206 仅回 range 长度）→ 不误杀
+    if (expectMs > 0) return total < (expectMs / 1000) * 2000;
+    return total < 1.2 * 1024 * 1024;
+  }
+  async function urlIsPreview(url, expectMs) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      var r = await axios.get(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', Referer: 'https://www.kugou.com/', Range: 'bytes=0-0' },
+        timeout: 4000, validateStatus: function () { return true; }, maxRedirects: 5,
+      });
+      var total = 0;
+      if (r.status >= 200 && r.status < 300) {
+        var cr = (r.headers && r.headers['content-range']) || '';
+        var mc = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr);
+        if (mc) total = parseInt(mc[1], 10);
+        else if (r.status === 200 && r.headers && r.headers['content-length']) total = parseInt(r.headers['content-length'], 10) || 0; // 206 的 content-length 仅 range 长度
+      }
+      return isPreviewBytes(total, expectMs);
+    } catch (e) { return false; } // 探测异常不误杀
+  }
+
   // ---- 通用备选源兜底封装：search → pickOrdered 身份校验 → url，命中即返回并打 X-Kg-Backup 溯源头 ----
   async function tryBackup(name, searchFn, urlFn, musicItem) {
     var q = (musicItem.title || '').trim() || (musicItem.artist || '').trim();
@@ -826,6 +854,8 @@
       try {
         var res = await urlFn(ordered[i], musicItem);
         if (res && res.url) {
+          // 【2026-11-16】试听/铃声短片段闸门：片段换下一候选，不再把 12s 无效音频交给播放器
+          if (await urlIsPreview(res.url, musicItem && musicItem.duration)) { lastErr = '试听/铃声短片段，已拒绝'; continue; }
           if (!res.headers) res.headers = {};
           res.headers['X-Kg-Backup'] = name;
           return res;
@@ -882,7 +912,7 @@
     // 2) 无名音乐网 mvmp3（不带 Referer 返回，否则 kuwo CDN 403）
     try {
       const src = await mvGetMediaSource(musicItem);
-      if (src && src.url) return src;
+      if (src && src.url && !(await urlIsPreview(src.url, musicItem && musicItem.duration))) return src;
     } catch (e) { errors.push('无名音乐网:' + e.message); }
 
     // 3) 歌曲宝 gequbao（无需每小时验证，作为 mvmp3 Cookie 过期时的兜底）
@@ -892,8 +922,14 @@
       const g = await gbSearch(q);
       const ordered = pickOrdered(g, musicItem);
       if (ordered && ordered.length) {
-        const url = await gbGetPlayUrl(ordered[0].id);
-        if (url) return { url: url, rawLrc: '', artwork: musicItem.coverImg || musicItem.artwork || '' };
+        for (var gbi = 0; gbi < Math.min(ordered.length, 3); gbi++) {
+          const url = await gbGetPlayUrl(ordered[gbi].id);
+          // 【2026-11-16】试听/铃声短片段闸门：片段换下一候选
+          if (url && !(await urlIsPreview(url, musicItem && musicItem.duration))) {
+            return { url: url, rawLrc: '', artwork: musicItem.coverImg || musicItem.artwork || '' };
+          }
+        }
+        errors.push('歌曲宝:仅试听短片段');
       } else {
         errors.push('歌曲宝:无安全候选'); // 空池不再静默跳过，记 error 便于总报错明细定位
       }
@@ -915,7 +951,7 @@
     // ⑭ 极端末位：AAX音乐网 aax.cx（酷我系直链，本轮实测 0 结果，仅作最后兜底层；修复前跳过即不阻断）
     try {
       const src = await aaxGetMediaSource(musicItem);
-      if (src && src.url) return src;
+      if (src && src.url && !(await urlIsPreview(src.url, musicItem && musicItem.duration))) return src;
     } catch (e) { errors.push('AAX音乐网:' + e.message); }
 
     var songName = (musicItem.title || '') + (musicItem.artist ? '（' + musicItem.artist + '）' : '');
@@ -1253,7 +1289,7 @@
   // ============================ 导出 ============================
   var plugin = {
     platform: '酷狗',
-    version: '0.1.14',
+    version: '0.1.15',
     author: 'tianpeng + 优化(下沉 qq.js v0.1.8 三态校验)',
     description: '酷狗官方 + 无名音乐网(mvmp3，自动过人机验证) + 歌曲宝(gequbao) + AAX音乐网(aax.cx) 等，官方+14 备用源顺序兜底（共 15 层）取链；' +
       'v0.1.0：下沉 qq.js v0.1.8 三态身份校验修复「同名异版错播」、新增第③备用源 AAX音乐网(三层→四层)、' +
@@ -1264,7 +1300,7 @@
       'v0.0.9 修复：歌单详情/导入取歌改用 mobilecdn special/song JSON 接口，解决点进歌单歌曲空白。' +
       'v0.1.14 修复：歌词链引入宽松选池（严格池拒绝错播为空时按歌名匹配兜底，同歌手优先），解决「部分歌单可播放但不显示歌词」；歌曲宝歌词扩为前 3 候选。' +
       '⚠️ 仅供个人学习与研究使用。',
-    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.14/musicfree-kg/github/kg.js',
+    srcUrl: 'https://cdn.jsdelivr.net/gh/buaiwanyouxi/musicfree-all@v0.1.15/musicfree-kg/github/kg.js',
     cacheControl: 'no-store',
     supportedSearchType: ['music'],
     primaryKey: ['id', 'album_id', 'album_audio_id'],
@@ -1323,6 +1359,9 @@
     getRecommendSheetsByTag: getRecommendSheetsByTag,
     // ============================ v0.1.0 内部诊断接口（仅供测试 / 运维，不影响取链） ============================
     _internal: {
+      // 【2026-11-16】试听/铃声短片段闸门（供单测）
+      isPreviewBytes: isPreviewBytes,
+      urlIsPreview: urlIsPreview,
       // 第一批 + 第四批：三态身份校验 / 统一选池 / 取链打分
       norm: norm,
       titleOk: titleOk,
